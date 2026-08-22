@@ -1,0 +1,174 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1120" viewBox="0 0 1600 1120">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f7f9fc"/>
+      <stop offset="100%" stop-color="#eef3f8"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="7" flood-color="#22344d" flood-opacity="0.14"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#60738b"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#3978d4"/>
+    </marker>
+    <style>
+      .title { font: 700 34px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; fill:#17243a; }
+      .subtitle { font: 400 17px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; fill:#637187; }
+      .section { font: 700 18px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; fill:#34445b; letter-spacing:1px; }
+      .nodeTitle { font: 700 20px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; fill:#17243a; }
+      .nodeText { font: 400 15px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; fill:#4f6075; }
+      .small { font: 400 14px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; fill:#5e7087; }
+      .tiny { font: 500 13px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; fill:#52657d; }
+      .box { stroke-width:1.5; filter:url(#shadow); }
+      .flow { fill:none; stroke:#60738b; stroke-width:2.5; marker-end:url(#arrow); }
+      .primaryFlow { fill:none; stroke:#3978d4; stroke-width:3.2; marker-end:url(#arrowBlue); }
+      .telemetry { fill:none; stroke:#8b6ac9; stroke-width:2; stroke-dasharray:7 7; marker-end:url(#arrow); }
+      .config { fill:none; stroke:#e18b33; stroke-width:2; stroke-dasharray:7 6; marker-end:url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1120" fill="url(#bg)"/>
+
+  <text x="80" y="62" class="title">多租户节点化 Agent 部署平台 · 第一版架构</text>
+  <text x="80" y="94" class="subtitle">基于 tRPC-Agent-Go：接入适配 → 网关路由 → Session 调度 → Worker 执行 → 共享存储</text>
+
+  <!-- Main data plane -->
+  <rect x="55" y="128" width="1110" height="870" rx="22" fill="#ffffff" stroke="#d9e2ee" stroke-width="1.5"/>
+  <text x="82" y="165" class="section">数据面 · 请求主链路</text>
+
+  <!-- Sources -->
+  <rect class="box" x="90" y="205" width="210" height="112" rx="16" fill="#e8f2ff" stroke="#9cc5f8"/>
+  <text x="195" y="239" text-anchor="middle" class="nodeTitle">外部消息源</text>
+  <text x="195" y="269" text-anchor="middle" class="nodeText">企业微信 / 微信 / Telegram</text>
+  <text x="195" y="294" text-anchor="middle" class="nodeText">Web / API / AG-UI / A2A</text>
+
+  <!-- Message Adapter -->
+  <rect class="box" x="375" y="185" width="270" height="152" rx="18" fill="#e9f8f4" stroke="#8ed1be"/>
+  <text x="510" y="221" text-anchor="middle" class="nodeTitle">Message Adapter</text>
+  <text x="510" y="250" text-anchor="middle" class="nodeText">Channel Adapter</text>
+  <text x="510" y="274" text-anchor="middle" class="nodeText">Protocol / API Adapter</text>
+  <line x1="402" y1="290" x2="618" y2="290" stroke="#b4ddd2"/>
+  <text x="510" y="315" text-anchor="middle" class="tiny">协议转换 · 身份映射 · 消息规范化</text>
+
+  <!-- Idempotency -->
+  <rect class="box" x="720" y="205" width="205" height="112" rx="16" fill="#fff4df" stroke="#efc572"/>
+  <text x="822" y="240" text-anchor="middle" class="nodeTitle">统一幂等处理</text>
+  <text x="822" y="269" text-anchor="middle" class="nodeText">消息去重</text>
+  <text x="822" y="294" text-anchor="middle" class="tiny">来源 + 租户 + message_id</text>
+
+  <!-- Gateway -->
+  <rect class="box" x="185" y="405" width="300" height="154" rx="18" fill="#eaf0ff" stroke="#9ab0ef"/>
+  <text x="335" y="443" text-anchor="middle" class="nodeTitle">Agent Gateway</text>
+  <text x="335" y="473" text-anchor="middle" class="nodeText">租户识别 · 鉴权 · 限流</text>
+  <text x="335" y="498" text-anchor="middle" class="nodeText">Agent / 版本 / 灰度路由</text>
+  <text x="335" y="523" text-anchor="middle" class="nodeText">Worker 选择与请求调度</text>
+
+  <!-- Session scheduler -->
+  <rect class="box" x="610" y="405" width="300" height="154" rx="18" fill="#f2ebff" stroke="#b9a0e9"/>
+  <text x="760" y="443" text-anchor="middle" class="nodeTitle">Session Scheduler</text>
+  <text x="760" y="473" text-anchor="middle" class="nodeText">同一 Session 顺序执行</text>
+  <text x="760" y="498" text-anchor="middle" class="nodeText">不同 Session 并行执行</text>
+  <text x="760" y="523" text-anchor="middle" class="nodeText">等待 · 取消 · 异常恢复</text>
+
+  <!-- Workers -->
+  <rect x="100" y="635" width="965" height="190" rx="20" fill="#f8fbff" stroke="#cfdceb" stroke-width="1.5"/>
+  <text x="130" y="670" class="section">AGENT WORKER 集群 · 无状态水平扩展</text>
+
+  <rect class="box" x="140" y="700" width="250" height="92" rx="15" fill="#e8f2ff" stroke="#98c0ee"/>
+  <text x="265" y="735" text-anchor="middle" class="nodeTitle">Agent Worker 1</text>
+  <text x="265" y="765" text-anchor="middle" class="nodeText">tRPC-Agent-Go Runner</text>
+
+  <rect class="box" x="455" y="700" width="250" height="92" rx="15" fill="#e8f2ff" stroke="#98c0ee"/>
+  <text x="580" y="735" text-anchor="middle" class="nodeTitle">Agent Worker 2</text>
+  <text x="580" y="765" text-anchor="middle" class="nodeText">tRPC-Agent-Go Runner</text>
+
+  <rect class="box" x="770" y="700" width="250" height="92" rx="15" fill="#e8f2ff" stroke="#98c0ee"/>
+  <text x="895" y="735" text-anchor="middle" class="nodeTitle">Agent Worker N</text>
+  <text x="895" y="765" text-anchor="middle" class="nodeText">tRPC-Agent-Go Runner</text>
+
+  <!-- Runtime details -->
+  <rect class="box" x="130" y="865" width="370" height="94" rx="16" fill="#ecf9ef" stroke="#9fd0aa"/>
+  <text x="315" y="900" text-anchor="middle" class="nodeTitle">tRPC-Agent-Go Runtime</text>
+  <text x="315" y="929" text-anchor="middle" class="nodeText">Agent 编排 · Tool/MCP · Plugin/Guardrail</text>
+
+  <rect class="box" x="595" y="865" width="420" height="94" rx="16" fill="#fff2ea" stroke="#edb18d"/>
+  <text x="805" y="900" text-anchor="middle" class="nodeTitle">Storage Adapter / Router</text>
+  <text x="805" y="929" text-anchor="middle" class="nodeText">按租户选择、复用和路由数据后端</text>
+
+  <!-- Main arrows -->
+  <path class="primaryFlow" d="M300 261 H375"/>
+  <path class="primaryFlow" d="M645 261 H720"/>
+  <path class="primaryFlow" d="M822 317 V360 H335 V405"/>
+  <path class="primaryFlow" d="M485 482 H610"/>
+  <path class="primaryFlow" d="M760 559 V610 H580 V635"/>
+  <path class="primaryFlow" d="M580 825 V845 H315 V865"/>
+  <path class="primaryFlow" d="M500 912 H595"/>
+
+  <!-- Shared storage -->
+  <rect x="55" y="1020" width="1110" height="75" rx="18" fill="#ffffff" stroke="#d9e2ee" stroke-width="1.5"/>
+  <text x="85" y="1050" class="section">共享存储层</text>
+  <rect x="230" y="1039" width="160" height="36" rx="10" fill="#fff4df" stroke="#efc572"/>
+  <text x="310" y="1063" text-anchor="middle" class="small">Session / Summary</text>
+  <rect x="415" y="1039" width="135" height="36" rx="10" fill="#e9f8f4" stroke="#8ed1be"/>
+  <text x="482" y="1063" text-anchor="middle" class="small">Memory</text>
+  <rect x="575" y="1039" width="155" height="36" rx="10" fill="#f2ebff" stroke="#b9a0e9"/>
+  <text x="652" y="1063" text-anchor="middle" class="small">Knowledge</text>
+  <rect x="755" y="1039" width="145" height="36" rx="10" fill="#e8f2ff" stroke="#98c0ee"/>
+  <text x="827" y="1063" text-anchor="middle" class="small">Artifact</text>
+  <rect x="925" y="1039" width="175" height="36" rx="10" fill="#f4f6f9" stroke="#bfcbd8"/>
+  <text x="1012" y="1063" text-anchor="middle" class="small">Audit Log</text>
+  <path class="primaryFlow" d="M805 959 V1020"/>
+
+  <!-- Control plane -->
+  <rect x="1200" y="128" width="345" height="377" rx="22" fill="#ffffff" stroke="#ead8bf" stroke-width="1.5"/>
+  <text x="1230" y="165" class="section">控制面</text>
+
+  <rect class="box" x="1240" y="205" width="265" height="90" rx="16" fill="#fff4df" stroke="#efc572"/>
+  <text x="1372" y="240" text-anchor="middle" class="nodeTitle">Admin API / Web UI</text>
+  <text x="1372" y="269" text-anchor="middle" class="nodeText">租户、Agent、发布管理</text>
+
+  <rect class="box" x="1240" y="335" width="265" height="128" rx="16" fill="#fff8ed" stroke="#e6bb78"/>
+  <text x="1372" y="370" text-anchor="middle" class="nodeTitle">配置与资源中心</text>
+  <text x="1372" y="400" text-anchor="middle" class="nodeText">Model / Tool / Channel</text>
+  <text x="1372" y="425" text-anchor="middle" class="nodeText">Backend / Policy / Secret</text>
+  <text x="1372" y="449" text-anchor="middle" class="tiny">版本化配置 · 灰度 · 回滚</text>
+
+  <path class="flow" d="M1372 295 V335"/>
+  <path class="config" d="M1240 400 H1135 V482 H910"/>
+  <path class="config" d="M1240 430 H1110 V745 H1020"/>
+  <text x="1120" y="389" class="tiny" fill="#b06c29">配置发布</text>
+
+  <!-- Observability -->
+  <rect x="1200" y="550" width="345" height="445" rx="22" fill="#ffffff" stroke="#d9cff0" stroke-width="1.5"/>
+  <text x="1230" y="587" class="section">可观测与审计</text>
+
+  <rect class="box" x="1240" y="630" width="265" height="108" rx="16" fill="#f2ebff" stroke="#b9a0e9"/>
+  <text x="1372" y="668" text-anchor="middle" class="nodeTitle">Telemetry Collector</text>
+  <text x="1372" y="698" text-anchor="middle" class="nodeText">统一采集、处理与导出</text>
+  <text x="1372" y="722" text-anchor="middle" class="tiny">OpenTelemetry</text>
+
+  <rect class="box" x="1240" y="790" width="265" height="156" rx="16" fill="#f7f4fd" stroke="#c9b7e8"/>
+  <text x="1372" y="828" text-anchor="middle" class="nodeTitle">观测后端</text>
+  <text x="1372" y="859" text-anchor="middle" class="nodeText">Trace · Metrics · Logs</text>
+  <text x="1372" y="885" text-anchor="middle" class="nodeText">成本统计 · 告警 · Audit</text>
+  <text x="1372" y="915" text-anchor="middle" class="tiny">request_id / trace_id 贯穿全链路</text>
+
+  <path class="flow" d="M1372 738 V790"/>
+
+  <!-- Telemetry dotted feeds -->
+  <path class="telemetry" d="M645 235 H1175 V655 H1240"/>
+  <path class="telemetry" d="M910 455 H1160 V680 H1240"/>
+  <path class="telemetry" d="M1065 745 H1145 V705 H1240"/>
+  <path class="telemetry" d="M1015 912 H1125 V730 H1240"/>
+
+  <!-- Legend -->
+  <rect x="1200" y="1020" width="345" height="75" rx="18" fill="#ffffff" stroke="#d9e2ee"/>
+  <line x1="1230" y1="1047" x2="1285" y2="1047" class="primaryFlow"/>
+  <text x="1300" y="1052" class="tiny">业务主链路</text>
+  <line x1="1380" y1="1047" x2="1435" y2="1047" class="telemetry"/>
+  <text x="1450" y="1052" class="tiny">旁路埋点</text>
+  <line x1="1230" y1="1076" x2="1285" y2="1076" class="config"/>
+  <text x="1300" y="1081" class="tiny">配置下发</text>
+</svg>
