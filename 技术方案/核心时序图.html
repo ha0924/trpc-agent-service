@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent 平台核心消息时序图</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f7f8fa; color: #1f2328; margin: 0; padding: 24px; }
+  .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; max-width: 1200px; margin-left: auto; margin-right: auto; }
+  h1 { font-size: 20px; margin: 0; font-weight: 600; }
+  .hint { font-size: 12px; color: #8b949e; margin-top: 4px; }
+  #diagram { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 20px; overflow: auto; max-width: 1200px; margin: 0 auto; box-shadow: 0 1px 3px rgba(0,0,0,.04); }
+  #diagram .mermaid { display: block; min-width: 1080px; margin: 0; padding: 0; }
+  #diagram .mermaid svg { display: block; margin: 0 auto; }
+  button { background: #2563eb; color: #fff; border: none; border-radius: 8px; padding: 8px 16px; font-size: 14px; cursor: pointer; }
+  button:hover { background: #1d4ed8; }
+  #status { font-size: 13px; color: #8b949e; margin-left: 12px; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <h1>核心消息时序图</h1>
+      <div class="hint">抽象 IM 平台消息 → 幂等与会话调度 → Agent / Tool 执行 → Session / Memory 写入 → IM 回复</div>
+    </div>
+    <div>
+      <span id="status"></span>
+      <button id="download">下载 SVG</button>
+    </div>
+  </div>
+
+  <div id="diagram">
+    <pre class="mermaid">
+sequenceDiagram
+    actor User as IM 用户
+    participant IM as IM 平台
+    participant CA as Channel Adapter
+    participant GW as Agent Gateway
+    participant SS as Session Scheduler
+    participant WK as Agent Worker / Runtime
+    participant ST as 共享存储
+    participant EXT as LLM / Tool / MCP
+
+    Note over User,GW: ① IM 入站与消息标准化
+    User->>IM: 发送消息
+    IM->>CA: 回调 / 事件投递
+    CA->>CA: 验签、解析、身份映射
+    Note right of CA: 提取 IM 原生 event_id / message_id
+    CA->>GW: 统一消息 + 通道上下文
+
+    Note over GW,SS: ② 幂等、目标 Agent 识别与会话调度
+    GW->>ST: 原子创建入站幂等记录
+    alt 首次收到该 IM 事件
+      ST-->>GW: 已占位（processing）
+      GW->>GW: 通过 Channel Binding 识别租户、Agent 与 Session
+      GW->>SS: 提交 Session 执行任务
+      SS->>SS: 同一 Session 串行，不同 Session 并行
+      SS->>WK: 分派健康 Worker
+    else 重复事件
+      ST-->>GW: 已存在
+      GW-->>CA: 不重复执行
+      CA-->>IM: 快速确认回调
+    end
+
+    Note over WK,EXT: ③ Agent 执行与 Tool 调用
+    WK->>ST: 读取 Session、Summary、Memory
+    ST-->>WK: 返回共享上下文
+    WK->>WK: 获取或构建 Agent Runtime
+    Note right of WK: Runtime 内执行 Plugin / Guardrail / Callbacks
+    WK->>EXT: Runner 执行 Agent / 调用 LLM
+    loop Agent 需要调用 Tool 时
+      EXT-->>WK: Tool Call
+      WK->>EXT: 调用 Tool / MCP / 外部服务
+      EXT-->>WK: Tool Result
+      WK->>EXT: 继续 Agent 推理
+    end
+    EXT-->>WK: 最终回复
+
+    Note over WK,ST: ④ 状态持久化与 IM 回复
+    WK->>ST: 写入 Session Event，更新 Session State
+    WK->>ST: 按策略写入 / 更新 Memory
+    WK-)ST: 异步提交 Summary 更新
+    WK-->>CA: 返回最终回复
+    CA->>CA: 按 IM 能力转换文本 / 卡片 / 文件
+    CA->>IM: 发送回复
+    IM-->>User: 用户收到回复
+    GW->>ST: 标记幂等记录完成，写入审计状态
+    Note over CA,ST: 全链路携带 trace_id / request_id；发送失败时仅重试 IM 投递
+    </pre>
+  </div>
+
+  <script>
+    var cdnList = [
+      'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js',
+      'https://unpkg.com/mermaid@11/dist/mermaid.min.js',
+      'https://cdn.bootcdn.net/ajax/libs/mermaid/11.4.1/mermaid.min.js'
+    ];
+    var statusEl = document.getElementById('status');
+    var diagramEl = document.getElementById('diagram');
+
+    function loadMermaid(i) {
+      if (i >= cdnList.length) {
+        statusEl.textContent = '加载 mermaid 库失败，请检查网络后刷新';
+        return;
+      }
+      var s = document.createElement('script');
+      s.src = cdnList[i];
+      s.onload = function () { initMermaid(); };
+      s.onerror = function () { loadMermaid(i + 1); };
+      document.head.appendChild(s);
+    }
+
+    function initMermaid() {
+      mermaid.initialize({
+        startOnLoad: true,
+        theme: 'default',
+        sequence: { useMaxWidth: false, wrap: true, diagramMarginX: 30, diagramMarginY: 20 }
+      });
+      statusEl.textContent = '';
+    }
+
+    document.getElementById('download').addEventListener('click', function () {
+      var svg = diagramEl.querySelector('svg');
+      if (!svg) { statusEl.textContent = '图尚未渲染完成'; return; }
+      var clone = svg.cloneNode(true);
+      clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+      var xml = new XMLSerializer().serializeToString(clone);
+      var blob = new Blob([xml], { type: 'image/svg+xml;charset=utf-8' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'agent-core-message-sequence.svg';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
+
+    loadMermaid(0);
+  </script>
+</body>
+</html>
