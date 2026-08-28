@@ -131,7 +131,25 @@ Tenant
 | Agent Worker | 加载 Runtime，执行 Runner、模型、Tool 和存储读写 |
 | Runtime Registry | Worker 本地 Runtime 缓存，可在丢失后重新构建 |
 
-同一个 Session 不绑定 Worker。Session Scheduler 保证同一 Session 的消息按顺序执行；不同 Session 可以并行处理。
+Session Scheduler 不是独立部署的服务，而是 Gateway 和 Worker 共用的调度库。它由两部分组成，状态都保存在 Redis：
+
+```text
+Session 租约：同一时刻只有一个 Worker 能处理某个 Session，带 TTL 自动过期
+Session 信箱：该 Session 待处理的消息，按到达顺序排列
+```
+
+执行过程如下：
+
+```text
+Gateway 写入信箱 → 通过消息队列通知
+→ Worker 抢占租约，抢不到则不处理
+→ 持有租约期间排空信箱，并持续续期
+→ 信箱为空后释放租约
+```
+
+租约按轮持有，范围是一次排空信箱的时间，不是整个会话生命周期。同一个 Session 的下一轮消息由任意健康 Worker 处理，因此 Session 不绑定 Worker，也不需要 sticky session。不同 Session 之间并行执行。
+
+消息队列只承担“该 Session 有待处理消息”的分发提示，不要求有序，顺序性由租约和信箱共同保证。
 
 ### 4.3 租户隔离
 
