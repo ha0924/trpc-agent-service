@@ -25,6 +25,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"github.com/liuzengh/trpc-agent-service/trpcservice/admin"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	applog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
@@ -97,6 +98,12 @@ func (g *Gateway) Router() *gin.Engine {
 
 	r.GET("/healthz", g.handleHealth)
 	r.GET("/metrics", gin.WrapF(g.metrics.Registry().Handler()))
+
+	// The control-plane API lives here because Gateway is already the process
+	// with a public listener and a database connection; Workers expose
+	// nothing callable.
+	admin.New(g.store, g.log).Register(r)
+
 	r.Any("/webhook/*path", g.handleWebhook)
 	return r
 }
