@@ -15,3 +15,7 @@ vendor/
 
 data/*
 !data/README.md
+
+# 本地配置含明文凭据，只提交示例文件
+configs/config.yaml
+configs/*.local.yaml
