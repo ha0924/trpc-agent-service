@@ -44,6 +44,39 @@ SELECT channel_binding_id, tenant_id, agent_app_id, env, channel,
 	return &b, nil
 }
 
+// ChannelBindingByID loads a binding by its business identifier.
+//
+// Worker needs this on the outbound path: it knows which binding a session
+// belongs to but not the webhook path, and it needs the binding's credentials
+// and capability limits to deliver a reply.
+func (s *Store) ChannelBindingByID(ctx context.Context, tenantID, bindingID string) (*types.ChannelBinding, error) {
+	const q = `
+SELECT channel_binding_id, tenant_id, agent_app_id, env, channel,
+       COALESCE(external_app_id, ''), COALESCE(webhook_path, ''),
+       COALESCE(secret_ref, ''), capabilities, status
+  FROM channel_bindings
+ WHERE tenant_id = ? AND channel_binding_id = ?`
+
+	var (
+		b       types.ChannelBinding
+		capsRaw []byte
+	)
+	err := s.db.QueryRowContext(ctx, q, tenantID, bindingID).Scan(
+		&b.ChannelBindingID, &b.TenantID, &b.AgentAppID, &b.Env, &b.Channel,
+		&b.ExternalAppID, &b.WebhookPath, &b.SecretRef, &capsRaw, &b.Status,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("channel binding %q: %w", bindingID, ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query channel binding %q: %w", bindingID, err)
+	}
+	if err := decodeJSON(capsRaw, &b.Capabilities); err != nil {
+		return nil, fmt.Errorf("decode capabilities for %s: %w", bindingID, err)
+	}
+	return &b, nil
+}
+
 // TenantByID loads a tenant.
 func (s *Store) TenantByID(ctx context.Context, tenantID string) (*types.Tenant, error) {
 	const q = `SELECT tenant_id, name, status, settings FROM tenants WHERE tenant_id = ?`

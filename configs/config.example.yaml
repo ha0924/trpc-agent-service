@@ -60,17 +60,18 @@ storage:
   backends:
     - name: redis-main
       kind: redis
-    - name: mysql-main
-      kind: mysql
+    - name: memory-main
+      kind: inmemory
   # 未匹配到具体规则时的默认后端
   defaults:
     session: redis-main
-  # 按租户与数据类型覆盖默认值
+  # 按租户与数据类型覆盖默认值。规则越具体优先级越高：
+  # 租户+Agent+数据类型 > 租户+数据类型 > 默认值。
   rules: []
     # - tenant_id: tenant-demo
     #   agent_app_id: assistant
     #   data_type: session
-    #   backend: mysql-main
+    #   backend: memory-main
 
 # 模型凭据。
 # 配置库中只存 secret:// 引用，此处是引用到实际值的解析表。

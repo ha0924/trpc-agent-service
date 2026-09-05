@@ -5,6 +5,7 @@ package types
 
 import (
 	"context"
+	"strings"
 
 	"trpc.group/trpc-go/trpc-agent-go/session"
 )
@@ -65,4 +66,31 @@ type StorageRouter interface {
 
 	// Close releases all backend connections the router owns.
 	Close() error
+}
+
+// appNameSeparator joins the tenant and agent inside a session app name.
+const appNameSeparator = "/"
+
+// AppName encodes the tenant and agent into the framework's session app name.
+//
+// The framework keys sessions by (AppName, UserID, SessionID) and has no
+// tenant concept of its own. Putting the tenant in the app name gives two
+// things at once: keys of different tenants cannot collide inside a shared
+// backend, and the router can recover the tenant from a call that only
+// carries a session key.
+func AppName(tenantID, agentAppID string) string {
+	return tenantID + appNameSeparator + agentAppID
+}
+
+// ParseAppName recovers the tenant and agent from an app name.
+//
+// It reports ok=false rather than guessing when the name is not in the
+// expected shape. A caller that silently treated a malformed name as an empty
+// tenant would route one tenant's data into another's backend.
+func ParseAppName(appName string) (tenantID, agentAppID string, ok bool) {
+	idx := strings.Index(appName, appNameSeparator)
+	if idx <= 0 || idx == len(appName)-1 {
+		return "", "", false
+	}
+	return appName[:idx], appName[idx+1:], true
 }
