@@ -94,6 +94,12 @@ func run() error {
 	logger.Info("capabilities registered",
 		"tools", tools.Names(), "extensions", extensions.Names())
 
+	// Ordinary audit records go through the async sink so a database write
+	// does not sit on every user's reply path. Records that must be durable
+	// before a side effect — dangerous tool intent — bypass it.
+	audit := store.NewAsyncAuditSink(db, logger, 2048)
+	defer audit.Close()
+
 	// The store is the spec loader: assembly reads a version's prompt, model
 	// and bindings straight from the control plane, so no agent is defined in
 	// code.
@@ -103,7 +109,13 @@ func run() error {
 		Router:     router,
 		Tools:      tools,
 		Extensions: extensions,
-		Logger:     logger,
+		Policies: platformagent.PolicyDeps{
+			Audit:   audit,
+			Budget:  budgetCounter{sched},
+			Tenants: db,
+			Users:   db,
+		},
+		Logger: logger,
 	})
 	if err != nil {
 		return err
@@ -154,6 +166,19 @@ type specLoader struct{ *store.Store }
 // Load reads the version configuration the assembler needs.
 func (l specLoader) Load(ctx context.Context, key types.RuntimeKey) (*types.RuntimeSpec, error) {
 	return l.Store.RuntimeSpec(ctx, key)
+}
+
+// budgetCounter adapts the scheduler's typed periods to the plain-string
+// interface the agent package declares, so the agent package does not have to
+// import the scheduler just to name a period.
+type budgetCounter struct{ *scheduler.Redis }
+
+func (b budgetCounter) UsedTokens(ctx context.Context, tenantID, period string) (int64, error) {
+	return b.Redis.UsedTokens(ctx, tenantID, scheduler.BudgetPeriod(period))
+}
+
+func (b budgetCounter) AddTokens(ctx context.Context, tenantID, period string, tokens int64) (int64, error) {
+	return b.Redis.AddTokens(ctx, tenantID, scheduler.BudgetPeriod(period), tokens)
 }
 
 // evictIdleRuntimes releases Runtimes no session has used recently. Without

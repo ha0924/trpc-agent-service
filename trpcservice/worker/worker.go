@@ -309,10 +309,16 @@ func (w *Worker) processMessage(
 
 	// Persist the user's turn before running, so the conversation is on record
 	// even if execution fails.
+	//
+	// Scrubbed unconditionally, not by policy. The design forbids credentials
+	// from reaching Session and Memory at all, and session_events is worse
+	// than a log: it is long-retained and replayed as conversation history
+	// into every later model call, so one pasted credential would be resent
+	// on every subsequent turn.
 	if _, err := w.store.AppendSessionEvent(ctx, &types.SessionEvent{
 		TenantID: rc.TenantID, SessionID: rc.SessionID,
 		EventType: types.EventTypeUserMessage, Role: "user",
-		Content:   map[string]any{"text": msg.Text},
+		Content:   map[string]any{"text": applog.Scrub(msg.Text)},
 		RequestID: rc.RequestID, TraceID: rc.TraceID, AgentVersion: rc.AgentVersion,
 	}); err != nil {
 		return fmt.Errorf("persist user event: %w", err)
@@ -339,7 +345,7 @@ func (w *Worker) processMessage(
 	if _, err := w.store.AppendSessionEvent(ctx, &types.SessionEvent{
 		TenantID: rc.TenantID, SessionID: rc.SessionID,
 		EventType: types.EventTypeAgentMessage, Role: "assistant",
-		Content:   map[string]any{"text": reply},
+		Content:   map[string]any{"text": applog.Scrub(reply)},
 		RequestID: rc.RequestID, TraceID: rc.TraceID, AgentVersion: rc.AgentVersion,
 	}); err != nil {
 		return fmt.Errorf("persist agent event: %w", err)

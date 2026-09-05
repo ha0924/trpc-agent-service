@@ -13,6 +13,7 @@ import (
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/tool"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/types"
 )
@@ -21,10 +22,51 @@ import (
 //
 // Extensions receive this rather than the agent, so an extension cannot reach
 // past its mount point and reconfigure the agent itself.
+//
+// Deps carries the collaborators a policy needs — the audit sink, the budget
+// counter, the store. Passing them here rather than letting each extension
+// construct its own keeps credentials and connections in one place.
 type MountPoints struct {
 	Agent  *agent.Callbacks
 	Model  *model.Callbacks
+	Tool   *tool.Callbacks
 	Logger *slog.Logger
+
+	// Spec is the version being assembled. Policies read it to know which
+	// tools are bound and in what mode.
+	Spec *types.RuntimeSpec
+
+	// Deps are the platform services a policy may use. Any of them may be
+	// nil when a process does not provide it; policies must degrade rather
+	// than panic.
+	Deps PolicyDeps
+}
+
+// PolicyDeps are the platform services governance policies depend on.
+type PolicyDeps struct {
+	Audit   types.AuditSink
+	Budget  BudgetCounter
+	Tenants TenantSettingsLoader
+	Users   ChannelUserLoader
+}
+
+// BudgetCounter tracks token consumption per tenant and period.
+//
+// An interface rather than the concrete Redis type so the agent package does
+// not depend on the scheduler, and so a test can supply a fake.
+type BudgetCounter interface {
+	UsedTokens(ctx context.Context, tenantID string, period string) (int64, error)
+	AddTokens(ctx context.Context, tenantID string, period string, tokens int64) (int64, error)
+}
+
+// TenantSettingsLoader reads a tenant's policy knobs.
+type TenantSettingsLoader interface {
+	TenantSettings(ctx context.Context, tenantID string) (*types.TenantSettings, error)
+}
+
+// ChannelUserLoader resolves an external IM identity and its attributes.
+type ChannelUserLoader interface {
+	ChannelUserByExternalID(ctx context.Context, bindingID, externalUserID string) (*types.ChannelUser, error)
 }
 
 // Extension attaches one configured capability to the mount points.
@@ -46,9 +88,26 @@ type ExtensionRegistry struct {
 }
 
 // NewExtensionRegistry returns a registry preloaded with the built-ins.
+//
+// The five governance policies required of the platform are all here, each
+// attached to a framework mount point rather than to a bespoke hook:
+//
+//	tool_whitelist            BeforeTool   allow / deny / ask per version
+//	dangerous_tool_approval   BeforeTool   confirmation before side effects
+//	redaction                 BeforeModel, AfterModel, AfterTool
+//	budget_limit              BeforeModel, AfterModel
+//	user_permission           BeforeAgent
+//
+// Which of them a version actually runs, and in what order, comes from
+// agent_extension_bindings — none of this is hardcoded into assembly.
 func NewExtensionRegistry() *ExtensionRegistry {
 	r := &ExtensionRegistry{exts: make(map[string]Extension)}
 	r.Register("request_logger", requestLogger)
+	r.Register("tool_whitelist", toolWhitelist)
+	r.Register("dangerous_tool_approval", dangerousToolApproval)
+	r.Register("redaction", redaction)
+	r.Register("budget_limit", budgetLimit)
+	r.Register("user_permission", userPermission)
 	return r
 }
 

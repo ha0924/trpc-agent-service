@@ -35,6 +35,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
+	"trpc.group/trpc-go/trpc-agent-go/tool"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	platformtool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
@@ -48,6 +49,7 @@ type Provider struct {
 	router     types.StorageRouter
 	tools      *platformtool.Registry
 	extensions *ExtensionRegistry
+	policies   PolicyDeps
 	log        *slog.Logger
 
 	mu    sync.Mutex
@@ -76,7 +78,11 @@ type Deps struct {
 	Router     types.StorageRouter
 	Tools      *platformtool.Registry
 	Extensions *ExtensionRegistry
-	Logger     *slog.Logger
+	// Policies are the platform services governance extensions depend on.
+	// Left zero, policies needing them refuse to mount rather than silently
+	// becoming no-ops that look like protection.
+	Policies PolicyDeps
+	Logger   *slog.Logger
 }
 
 // NewProvider builds a Provider.
@@ -105,7 +111,7 @@ func NewProvider(d Deps) (*Provider, error) {
 
 	return &Provider{
 		cfg: d.Config, specs: d.Specs, router: d.Router,
-		tools: tools, extensions: exts, log: logger,
+		tools: tools, extensions: exts, policies: d.Policies, log: logger,
 		cache:    make(map[types.RuntimeKey]*list.Element),
 		lru:      list.New(),
 		building: make(map[types.RuntimeKey]chan struct{}),
@@ -280,10 +286,14 @@ func (p *Provider) assemble(ctx context.Context, key types.RuntimeKey) (*types.R
 
 	agentCallbacks := agent.NewCallbacks()
 	modelCallbacks := model.NewCallbacks()
+	toolCallbacks := tool.NewCallbacks()
 	if err := p.extensions.Mount(spec.Extensions, &MountPoints{
 		Agent:  agentCallbacks,
 		Model:  modelCallbacks,
+		Tool:   toolCallbacks,
 		Logger: p.log,
+		Spec:   spec,
+		Deps:   p.policies,
 	}); err != nil {
 		return nil, fmt.Errorf("mount extensions for %s: %w", key, err)
 	}
@@ -302,6 +312,7 @@ func (p *Provider) assemble(ctx context.Context, key types.RuntimeKey) (*types.R
 			key.TenantID, key.AgentAppID, key.AgentVersion)),
 		llmagent.WithAgentCallbacks(agentCallbacks),
 		llmagent.WithModelCallbacks(modelCallbacks),
+		llmagent.WithToolCallbacks(toolCallbacks),
 	}
 	if spec.SystemPrompt != "" {
 		opts = append(opts, llmagent.WithInstruction(spec.SystemPrompt))

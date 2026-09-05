@@ -268,3 +268,8 @@ func (r *Redis) LeaseOwner(ctx context.Context, sessionID string) (string, error
 	}
 	return owner, nil
 }
+
+// isRedisNil reports whether err is redis' "key does not exist" sentinel.
+// Wrapped here so callers in this package need not import the driver just to
+// distinguish "absent" from "failed".
+func isRedisNil(err error) bool { return errors.Is(err, redis.Nil) }

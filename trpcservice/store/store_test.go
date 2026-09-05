@@ -128,11 +128,42 @@ func TestRuntimeSpecLoadsVersionAndBindings(t *testing.T) {
 			t.Errorf("tool %s mode = %q", tb.ToolName, tb.Mode)
 		}
 	}
-	if len(spec.Extensions) != 1 {
-		t.Fatalf("got %d extensions, want 1", len(spec.Extensions))
+	if len(spec.Extensions) == 0 {
+		t.Fatal("no extensions loaded; assembly would mount no governance at all")
 	}
-	if spec.Extensions[0].Kind != types.ExtensionKindCallback {
-		t.Errorf("extension kind = %q", spec.Extensions[0].Kind)
+
+	// Ordering is the property worth asserting, not the count: the count
+	// changes whenever seed data does, but mount order is load-bearing.
+	// Redaction has to run before anything that persists content, otherwise
+	// the unredacted form reaches the audit trail.
+	byName := make(map[string]types.ExtensionBinding, len(spec.Extensions))
+	for _, e := range spec.Extensions {
+		byName[e.ExtensionName] = e
+		if !e.Enabled {
+			t.Errorf("disabled extension %q should not have been loaded", e.ExtensionName)
+		}
+	}
+
+	if red, ok := byName["redaction"]; ok {
+		for name, other := range byName {
+			if name == "redaction" || other.Kind != red.Kind {
+				continue
+			}
+			if other.Priority <= red.Priority {
+				t.Errorf("redaction (priority %d) must mount before %s (priority %d)",
+					red.Priority, name, other.Priority)
+			}
+		}
+	}
+
+	// Within a kind, the loader must return rows already ordered by priority,
+	// since Mount relies on that order.
+	for i := 1; i < len(spec.Extensions); i++ {
+		prev, cur := spec.Extensions[i-1], spec.Extensions[i]
+		if prev.Kind == cur.Kind && prev.Priority > cur.Priority {
+			t.Errorf("extensions out of priority order: %s(%d) before %s(%d)",
+				prev.ExtensionName, prev.Priority, cur.ExtensionName, cur.Priority)
+		}
 	}
 	// MCP and skills are deliberately empty in phase one, but assembly must
 	// still iterate them so phase two is a data change rather than a code one.
