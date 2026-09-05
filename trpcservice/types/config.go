@@ -3,7 +3,10 @@
 
 package types
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Tenant is one company, department or business team, and the isolation
 // boundary for every other resource.
@@ -91,6 +94,43 @@ func (d *Deployment) TotalWeight() int {
 		total += r.Weight
 	}
 	return total
+}
+
+// PickVersion selects a version for a new session given a random draw.
+//
+// The caller supplies the draw rather than the function generating one, so
+// version selection is deterministic and testable. Pass a value in
+// [0, TotalWeight).
+//
+// Selection happens once, when the session is created, and the result is
+// frozen into sessions.agent_version. Re-drawing per message would let a
+// conversation switch versions mid-flight and see a different prompt, a
+// different model and a different tool set between two turns.
+func (d *Deployment) PickVersion(draw int) (string, error) {
+	total := d.TotalWeight()
+	if total <= 0 {
+		return "", fmt.Errorf("deployment %s/%s/%s has no positive weight",
+			d.TenantID, d.AgentAppID, d.Env)
+	}
+	if draw < 0 {
+		draw = 0
+	}
+	draw %= total
+
+	cumulative := 0
+	for _, r := range d.Routes {
+		if r.Weight <= 0 {
+			continue
+		}
+		cumulative += r.Weight
+		if draw < cumulative {
+			return r.Version, nil
+		}
+	}
+	// Unreachable while total > 0, but returning an error beats returning an
+	// empty version that would later fail as a missing runtime.
+	return "", fmt.Errorf("deployment %s/%s/%s: draw %d fell through weights",
+		d.TenantID, d.AgentAppID, d.Env, draw)
 }
 
 // ChannelBinding ties an external IM account to a tenant and an agent. It is

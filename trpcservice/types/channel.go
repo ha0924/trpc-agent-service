@@ -50,6 +50,20 @@ const (
 	InboundModeFetch InboundMode = "fetch"
 )
 
+// AckInfo is what a channel may echo back in its immediate response.
+//
+// Duplicate is set when the idempotency record already existed. The platform
+// still gets a successful ACK — a redelivery is not an error and must not be
+// retried — but the field lets a caller distinguish the two cases when
+// debugging, and lets a channel suppress a "received" notice for a message it
+// already answered.
+type AckInfo struct {
+	RequestID string
+	TraceID   string
+	SessionID string
+	Duplicate bool
+}
+
 // InboundChannel is the half of a channel that runs inside Gateway: it takes
 // an untrusted HTTP callback and turns it into verified platform messages.
 //
@@ -77,7 +91,11 @@ type InboundChannel interface {
 	// after the idempotency record is committed and before the message is
 	// queued, so the platform stops retrying while the agent is still
 	// working.
-	Ack(w http.ResponseWriter, r *http.Request, binding *ChannelBinding) error
+	//
+	// The channel formats its own ACK because platforms disagree on what one
+	// looks like: WeCom accepts an empty body, a webhook caller may expect
+	// JSON. Info carries the identifiers a caller can echo back.
+	Ack(w http.ResponseWriter, r *http.Request, binding *ChannelBinding, info AckInfo) error
 
 	// Capabilities reports this channel's fixed traits. Per-binding overrides
 	// come from channel_bindings.capabilities and take precedence.
