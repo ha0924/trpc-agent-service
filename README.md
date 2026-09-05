@@ -159,6 +159,9 @@ mysql -u root -p < deployments/sql/seed_governance.sql
 mysql -u root -p < deployments/sql/seed_wecom.sql
 mysql -u root -p < deployments/sql/seed_tenant2.sql
 
+# 可选：死信链路的演示素材（一个必然装配失败的 Agent）。生产勿导入。
+mysql -u root -p < deployments/sql/seed_deadletter_demo.sql
+
 # 2. 配置。config.yaml 含明文凭据，已被 .gitignore 排除
 cp configs/config.example.yaml configs/config.yaml
 $EDITOR configs/config.yaml          # 填 mysql.dsn
@@ -201,6 +204,35 @@ curl http://127.0.0.1:8080/healthz          # Gateway 健康
 curl http://127.0.0.1:8080/metrics          # 入站指标
 curl http://127.0.0.1:8081/metrics          # 执行指标、队列深度、Runtime 缓存
 curl http://127.0.0.1:8080/admin/tenants    # 租户列表
+```
+
+打开 trace 导出后可用内置的最小接收器观察链路，无需装 Jaeger：
+
+```bash
+python3 scripts/otlp_receiver.py 4318 &     # 收 OTLP
+# configs/config.yaml 里设 telemetry.enabled: true
+curl http://127.0.0.1:4318/dump             # 把 trace 树写到 /tmp/traces.txt
+```
+
+一条消息产生的树：
+
+```text
+gateway.inbound                            [gateway]
+└─ worker.round                            [worker]    抢到租约的一轮
+   └─ worker.message                       [worker]    单条消息
+      ├─ worker.deliver                    [worker]    出站投递
+      └─ invoke_agent tenant-demo-...-v1   [worker]    框架自动埋点
+         └─ chat deepseek-chat             [worker]    模型调用
+```
+
+同一个 `trace_id` 可在 trace 树、两个进程的日志、`session_events`、
+`inbound_events`、`audit_logs` 中相互查找。
+
+死信查询与重放：
+
+```bash
+curl http://127.0.0.1:8080/admin/sessions/<session_id>/deadletters
+curl -X POST http://127.0.0.1:8080/admin/sessions/<session_id>/deadletters/replay
 ```
 
 灰度与回滚是同一个接口，权重全量替换：
@@ -249,8 +281,9 @@ docker compose -f deployments/docker-compose.yml up --build
 | 审计日志（11 字段）与 Usage 记录 | ✅ |
 | 指标与 `/metrics` | ✅ 8 类，均带租户标签 |
 | Admin API、灰度与回滚 | ✅ |
-| `trace_id` 贯穿两进程 | ✅ |
-| OpenTelemetry 导出、向量库与对象存储后端、Graph 编排、MCP、Skill | 结构已留，实现按迭代计划推进 |
+| OpenTelemetry 跨进程 trace | ✅ 一条消息一棵树，Worker span 挂在 Gateway span 之下 |
+| 死信队列与对账扫描 | ✅ 毒消息隔离、重放、滞留请求重投 |
+| 向量库与对象存储后端、Graph 编排、MCP、Skill | 结构已留，实现按迭代计划推进 |
 
 模型未接入时回退到占位模型，是为了让整条链路在没有供应商账号的情况下也可验证。
 占位模型在输出里明确声明自己未接入，避免被误认成真实回答。
