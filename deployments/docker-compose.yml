@@ -1,0 +1,112 @@
+# 最小可运行部署
+#
+# 设计依据：docs/技术设计方案.md §8.5「容量与部署」
+#
+# 起 Gateway、两个 Worker、Redis 与 MySQL。两个 Worker 而非一个，是为了让
+# 「Worker 可互换、同一会话由租约保证顺序」这一条在最小部署里就能被验证，
+# 而不是等到生产才第一次遇到并发。
+#
+#   docker compose -f deployments/docker-compose.yml up --build
+#
+# 生产部署建议见 docs/技术设计方案.md §8.5：Gateway 与 Worker 各自多副本、
+# Redis 与 MySQL 高可用、密钥走 Secret Manager 而非环境变量。
+
+name: trpc-agent-platform
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-devpassword}
+      MYSQL_DATABASE: trpc_agent_platform
+    ports:
+      - "3306:3306"
+    volumes:
+      # 建表与种子脚本按文件名顺序执行，因此前缀决定了依赖关系：
+      # 先建表，再灌配置数据。
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./sql/schema_governance.sql:/docker-entrypoint-initdb.d/02-schema-governance.sql:ro
+      - ./sql/seed.sql:/docker-entrypoint-initdb.d/03-seed.sql:ro
+      - ./sql/seed_governance.sql:/docker-entrypoint-initdb.d/04-seed-governance.sql:ro
+      - ./sql/seed_wecom.sql:/docker-entrypoint-initdb.d/05-seed-wecom.sql:ro
+      - ./sql/seed_tenant2.sql:/docker-entrypoint-initdb.d/06-seed-tenant2.sql:ro
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # 应用必须等到数据库真正可用才启动，否则会在启动时 ping 失败退出。
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD:-devpassword}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # 租约、信箱与队列都是运行时状态，丢了可以从 inbound_events 恢复，
+    # 因此这里不开持久化，重启即清空。
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+      args:
+        BINARY: gateway
+    depends_on:
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    ports:
+      - "8080:8080"
+    environment: &app-env
+      CONFIG_PATH: /app/configs/config.yaml
+      # 一期用环境变量兜底密钥；生产接 Secret Manager 后本节可删。
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      MOCK_CHANNEL_TOKEN: ${MOCK_CHANNEL_TOKEN:-mock-token-abc}
+      ACME_CHANNEL_TOKEN: ${ACME_CHANNEL_TOKEN:-acme-token-xyz}
+      ACME_API_KEY: ${ACME_API_KEY:-}
+      WECOM_CREDENTIALS: ${WECOM_CREDENTIALS:-}
+    volumes:
+      - ./compose-config.yaml:/app/configs/config.yaml:ro
+    command: ["-config", "/app/configs/config.yaml"]
+
+  worker-1:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+      args:
+        BINARY: worker
+    depends_on:
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    ports:
+      - "8081:8081"
+    environment: *app-env
+    volumes:
+      - ./compose-config.yaml:/app/configs/config.yaml:ro
+    command: ["-config", "/app/configs/config.yaml", "-health-addr", ":8081"]
+
+  worker-2:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+      args:
+        BINARY: worker
+    depends_on:
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    ports:
+      - "8082:8081"
+    environment: *app-env
+    volumes:
+      - ./compose-config.yaml:/app/configs/config.yaml:ro
+    # 两个 Worker 的配置完全相同，包括不设 worker.id——各自从
+    # hostname+pid 生成，确保不会互相释放租约。
+    command: ["-config", "/app/configs/config.yaml", "-health-addr", ":8081"]
+
+volumes:
+  mysql-data:

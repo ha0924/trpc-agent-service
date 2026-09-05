@@ -122,7 +122,11 @@
 |-- data                   # 服务运行时数据
 |-- docs                   # 各模块说明与架构设计文档
 |-- cmd
-|   `-- trpc-service       # 命令行入口，可直接启动服务
+|   |-- gateway            # Gateway 进程：接收 IM 回调、幂等、入队
+|   `-- worker             # Worker 进程：消费队列、装配 Runtime、执行 Agent
+|-- configs                # 配置示例
+|-- deployments            # 建表脚本、Dockerfile、docker-compose
+|-- scripts                # 本机验证辅助脚本
 `-- trpcservice            # 源码
     |-- agent              # 基于 tRPC-Agent-Go 的 Agent 定义
     |-- channels           # 对接 IM 的 Channel Adapter
@@ -139,16 +143,114 @@
 
 ## 快速开始
 
-```bash
-git clone https://github.com/liuzengh/trpc-agent-service.git
-cd trpc-agent-service
+### 前置条件
 
+MySQL 8.0+ 与 Redis 7+。模型密钥可选：未配置时平台回退到占位模型，链路照样跑通，
+只是回复内容固定，且会在回复里明确声明「模型未接入」。
+
+### 本机运行
+
+```bash
+# 1. 建表与预置数据（12 张核心表 + 6 张治理表，两个租户）
+mysql -u root -p < deployments/sql/schema.sql
+mysql -u root -p < deployments/sql/schema_governance.sql
+mysql -u root -p < deployments/sql/seed.sql
+mysql -u root -p < deployments/sql/seed_governance.sql
+mysql -u root -p < deployments/sql/seed_wecom.sql
+mysql -u root -p < deployments/sql/seed_tenant2.sql
+
+# 2. 配置。config.yaml 含明文凭据，已被 .gitignore 排除
+cp configs/config.example.yaml configs/config.yaml
+$EDITOR configs/config.yaml          # 填 mysql.dsn
+
+# 3. 密钥走环境变量（后续接 Secret Manager 后可删）
+export MOCK_CHANNEL_TOKEN=mock-token-abc
+export DEEPSEEK_API_KEY=sk-xxx        # 可选
+
+# 4. 启动。WORKERS 控制 Worker 副本数
 ./build.sh
-./start.sh
+WORKERS=2 ./start.sh
 ```
 
-停止服务：
+### 发一条消息
+
+```bash
+curl -X POST http://127.0.0.1:8080/webhook/mock/demo \
+  -H 'Content-Type: application/json' \
+  -H 'X-Mock-Token: mock-token-abc' \
+  -d '{"event_id":"e1","user_id":"alice","text":"你好"}'
+```
+
+立刻返回 ACK，Agent 在 Worker 侧异步执行：
+
+```json
+{"ok":true,"request_id":"req-...","trace_id":"trace-...","session_id":"sess-..."}
+```
+
+回复通过通道主动推送。本机验证时可先起一个收集器接收：
+
+```bash
+python3 scripts/reply_collector.py 9090 /tmp/replies.jsonl &
+WORKERS=2 REPLY_URL=http://127.0.0.1:9090/reply ./start.sh
+```
+
+### 观察
+
+```bash
+curl http://127.0.0.1:8080/healthz          # Gateway 健康
+curl http://127.0.0.1:8080/metrics          # 入站指标
+curl http://127.0.0.1:8081/metrics          # 执行指标、队列深度、Runtime 缓存
+curl http://127.0.0.1:8080/admin/tenants    # 租户列表
+```
+
+灰度与回滚是同一个接口，权重全量替换：
+
+```bash
+curl -X PUT http://127.0.0.1:8080/admin/tenants/tenant-demo/agents/assistant/deployment \
+  -H 'Content-Type: application/json' \
+  -d '{"routes":[{"version":"v1","weight":90},{"version":"v2","weight":10}]}'
+```
+
+进行中的会话不受影响——每个会话在创建时固化了版本，回滚改变的是新会话去哪里。
+
+### 停止
 
 ```bash
 ./stop.sh
 ```
+
+发 SIGTERM 并等待在途轮次完成。一轮若被从中间掐断（Agent 已执行、回复未送达），
+留下的 `inbound_events` 记录不能重跑，因为其 Tool 已产生副作用。
+
+### 容器部署
+
+```bash
+docker compose -f deployments/docker-compose.yml up --build
+```
+
+起 Gateway、两个 Worker、MySQL 与 Redis，建表与种子数据自动执行。两个 Worker
+而非一个，是为了让「Worker 可互换、同一会话由租约保证顺序」在最小部署里就能被
+验证。生产部署建议见 `docs/技术设计方案.md` §8.5。
+
+## 实现状态
+
+设计文档见 [`docs/`](docs/)，索引与交付物对照见 [`docs/README.md`](docs/README.md)。
+
+| 能力 | 状态 |
+|---|---|
+| Gateway 与 Worker 两进程、队列解耦 | ✅ |
+| 入站幂等 → ACK → 入队 | ✅ |
+| Session 租约与信箱、跨节点顺序保证 | ✅ |
+| 配置驱动的 Runtime 装配与缓存 | ✅ |
+| 多租户隔离（同名同版本对抗性验证） | ✅ |
+| Storage Router，实现框架 `session.Service` | ✅ Redis + InMemory 两后端 |
+| IM 通道 | ✅ Mock、企业微信 |
+| 治理五策略 | ✅ 工具白名单、脱敏、预算、危险工具确认、用户权限 |
+| 审计日志（11 字段）与 Usage 记录 | ✅ |
+| 指标与 `/metrics` | ✅ 8 类，均带租户标签 |
+| Admin API、灰度与回滚 | ✅ |
+| `trace_id` 贯穿两进程 | ✅ |
+| OpenTelemetry 导出、向量库与对象存储后端、Graph 编排、MCP、Skill | 结构已留，实现按迭代计划推进 |
+
+模型未接入时回退到占位模型，是为了让整条链路在没有供应商账号的情况下也可验证。
+占位模型在输出里明确声明自己未接入，避免被误认成真实回答。

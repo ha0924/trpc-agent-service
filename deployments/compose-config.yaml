@@ -1,0 +1,113 @@
+# Docker Compose 环境下的配置。
+#
+# 与 config.example.yaml 的唯一差别是主机名：compose 里各服务用服务名互相解析，
+# 而非 127.0.0.1。密码取 compose 中 MYSQL_ROOT_PASSWORD 的默认值。
+#
+# 这份文件进版本库，因为它里面只有 compose 自造的开发口令，不涉及任何真实凭据；
+# 模型与通道密钥仍走环境变量。
+
+# 平台配置示例
+#
+# 复制为 configs/config.yaml 后按本机情况修改。
+# config.yaml 含明文凭据，已被 .gitignore 忽略，不要提交。
+#
+# 设计依据：docs/dev/代码组织方案.md §4「包结构」config 包
+#           docs/技术设计方案.md §7.4「密钥和脱敏」
+
+# Gateway 进程
+gateway:
+  addr: ":8080"
+  # 优雅停机等待时长：停止接收新请求后，等待在途请求完成的上限
+  shutdown_timeout: 30s
+
+# Worker 进程
+worker:
+  # 消费者标识，用于 Session 租约的 owner 字段。留空则用 hostname+pid
+  id: ""
+  # 同时处理的会话数上限
+  concurrency: 8
+  shutdown_timeout: 60s
+
+# 配置库与业务库
+mysql:
+  dsn: "root:devpassword@tcp(mysql:3306)/trpc_agent_platform?charset=utf8mb4&parseTime=true&loc=Local"
+  max_open_conns: 20
+  max_idle_conns: 5
+  conn_max_lifetime: 1h
+
+# 运行时状态：Session State、租约、信箱、队列
+redis:
+  addr: "redis:6379"
+  password: ""
+  db: 0
+
+# Session 调度
+scheduler:
+  # 租约 TTL。它同时是 Worker 故障后的恢复时间上限：
+  # 持有租约的 Worker 崩溃后，该会话被阻塞至多这么久。
+  # 过短会导致长任务执行中途丢失租约，过长会拖慢故障恢复。
+  lease_ttl: 30s
+  # 续期间隔，必须显著小于 lease_ttl
+  lease_renew_interval: 10s
+  # 单条消息的最大重试次数，超过后移入死信并继续排空信箱，
+  # 避免一条毒消息永久阻塞整个会话
+  max_message_attempts: 3
+
+# Runtime 装配与缓存
+runtime:
+  # 缓存容量上限。已发布版本不可变，缓存不会失效，
+  # 因此只需处理容量与空闲淘汰，无需失效逻辑。
+  cache_size: 64
+  # 空闲多久后释放 Runtime
+  idle_ttl: 30m
+
+# 存储路由：按 tenant + agent + data_type 选后端。
+# 一期映射从本文件读取，二期改为读 backend_configs / backend_bindings 两张表，
+# 届时只改 Provider 内部，StorageRouter 接口不变。
+storage:
+  backends:
+    - name: redis-main
+      kind: redis
+    - name: memory-main
+      kind: inmemory
+  # 未匹配到具体规则时的默认后端
+  defaults:
+    session: redis-main
+  # 按租户与数据类型覆盖默认值。规则越具体优先级越高：
+  # 租户+Agent+数据类型 > 租户+数据类型 > 默认值。
+  rules: []
+    # - tenant_id: tenant-demo
+    #   agent_app_id: assistant
+    #   data_type: session
+    #   backend: memory-main
+
+# 模型凭据。
+# 配置库中只存 secret:// 引用，此处是引用到实际值的解析表。
+# 一期用环境变量兜底，二期接入 Secret Manager 后本节可删除。
+secrets:
+  resolver: env
+  # secret:// 引用 → 环境变量名
+  mapping:
+    "secret://prod/tenant-demo/model/primary-api-key": DEEPSEEK_API_KEY
+    "secret://prod/tenant-demo/channel/mock-token": MOCK_CHANNEL_TOKEN
+    # 企业微信的凭据是一个 JSON 块，含 corp_id / secret / agent_id /
+    # token / encoding_aes_key。整体存在密钥管理器里，库中只留引用。
+    "secret://prod/tenant-demo/channel/wecom": WECOM_CREDENTIALS
+    # 第二个租户，密钥各自独立——一个租户的密钥解析不到，
+    # 只影响该租户，不会波及其他租户。
+    "secret://prod/tenant-acme/model/primary-api-key": ACME_API_KEY
+    "secret://prod/tenant-acme/channel/mock-token": ACME_CHANNEL_TOKEN
+
+# 模型服务端点。DeepSeek 兼容 OpenAI 协议，走同一个 client。
+models:
+  - name: deepseek-chat
+    base_url: "https://api.deepseek.com/v1"
+
+log:
+  level: info
+  # text 便于本地阅读，json 便于采集
+  format: text
+
+# 一期不接 Collector，仅要求 trace_id 贯穿两个进程的日志
+telemetry:
+  enabled: false
