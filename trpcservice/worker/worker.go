@@ -520,9 +520,21 @@ func (w *Worker) consumeEvents(
 					}
 				}
 			}
-			// Partial chunks are skipped: only the settled message is kept,
-			// otherwise a streamed answer would be concatenated twice.
-			if !e.Response.IsPartial && choice.Message.Content != "" {
+			// Only the assistant's own words go to the user.
+			//
+			// A tool result arrives as a message too, with role "tool" and a
+			// body of raw JSON meant for the model. Accumulating every
+			// non-partial message splices that JSON into the reply — the user
+			// sees {"result":7006652} followed by the real answer.
+			//
+			// Found by running a real model: the stub never calls tools, so
+			// this path was not exercised until DeepSeek was wired in.
+			//
+			// Partial chunks are skipped for a separate reason: a streamed
+			// answer would otherwise be concatenated twice.
+			if !e.Response.IsPartial &&
+				choice.Message.Role == model.RoleAssistant &&
+				choice.Message.Content != "" {
 				reply.WriteString(choice.Message.Content)
 			}
 		}
