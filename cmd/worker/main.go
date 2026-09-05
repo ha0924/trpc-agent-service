@@ -28,6 +28,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	applog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/scheduler"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/store"
@@ -100,6 +101,8 @@ func run() error {
 	audit := store.NewAsyncAuditSink(db, logger, 2048)
 	defer audit.Close()
 
+	recorder := metrics.NewRecorder(metrics.NewRegistry())
+
 	// The store is the spec loader: assembly reads a version's prompt, model
 	// and bindings straight from the control plane, so no agent is defined in
 	// code.
@@ -134,6 +137,9 @@ func run() error {
 		Lease:      sched,
 		Runtimes:   runtimes,
 		Channels:   registry,
+		Metrics:    recorder,
+		Usage:      db,
+		Audit:      audit,
 		Logger:     logger,
 	})
 	if err != nil {
@@ -142,7 +148,7 @@ func run() error {
 
 	// A health endpoint, not a service: Workers take work from the queue and
 	// expose nothing callable.
-	health := startHealthServer(*healthAddr, db, sched, runtimes, logger)
+	health := startHealthServer(*healthAddr, db, sched, runtimes, recorder, audit, logger)
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -212,9 +218,22 @@ func startHealthServer(
 	db *store.Store,
 	sched *scheduler.Redis,
 	runtimes *platformagent.Provider,
+	recorder *metrics.Recorder,
+	audit *store.AsyncAuditSink,
 	logger *slog.Logger,
 ) *http.Server {
 	mux := http.NewServeMux()
+
+	// Gauges are sampled at scrape time rather than pushed, so a value is
+	// never stale in the way a periodically-updated one would be.
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if n, err := sched.QueueLen(r.Context()); err == nil {
+			recorder.QueueDepth(n)
+		}
+		recorder.RuntimeCached(runtimes.Len())
+		recorder.AuditDropped(audit.Dropped())
+		recorder.Registry().Handler()(w, r)
+	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()

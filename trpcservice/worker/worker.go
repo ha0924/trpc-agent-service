@@ -29,10 +29,12 @@ import (
 	"time"
 
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/model"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	applog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/store"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/types"
 )
@@ -46,7 +48,16 @@ type Deps struct {
 	Lease      types.SessionLease
 	Runtimes   types.RuntimeProvider
 	Channels   *channels.Registry
+	Metrics    *metrics.Recorder
+	Usage      UsageSink
+	Audit      types.AuditSink
 	Logger     *slog.Logger
+}
+
+// UsageSink persists token and cost detail for reconciliation. Separate from
+// the budget counter: the counter enforces, this records.
+type UsageSink interface {
+	WriteUsage(ctx context.Context, u *types.UsageRecord) error
 }
 
 // Worker consumes session hints and executes agents.
@@ -58,6 +69,9 @@ type Worker struct {
 	lease      types.SessionLease
 	runtimes   types.RuntimeProvider
 	channels   *channels.Registry
+	metrics    *metrics.Recorder
+	usage      UsageSink
+	audit      types.AuditSink
 	log        *slog.Logger
 
 	// id identifies this process as a lease owner. Two Workers on one host
@@ -104,10 +118,17 @@ func New(d Deps) (*Worker, error) {
 		id = fmt.Sprintf("%s-%d", host, os.Getpid())
 	}
 
+	rec := d.Metrics
+	if rec == nil {
+		// Instrumentation must never be the reason a message fails.
+		rec = metrics.NewRecorder(metrics.NewRegistry())
+	}
+
 	return &Worker{
 		cfg: d.Config, store: d.Store, dispatcher: d.Dispatcher,
 		mailbox: d.Mailbox, lease: d.Lease, runtimes: d.Runtimes,
-		channels: d.Channels, log: logger, id: id,
+		channels: d.Channels, metrics: rec, usage: d.Usage, audit: d.Audit,
+		log: logger, id: id,
 		slots: make(chan struct{}, d.Config.Worker.Concurrency),
 	}, nil
 }
@@ -189,6 +210,7 @@ func (w *Worker) handleHint(ctx context.Context, hint types.SessionHint) {
 	if !won {
 		// Expected under at-least-once delivery: another Worker owns this
 		// session right now and will drain it, including our message.
+		w.metrics.LeaseContention(hint.TenantID)
 		log.Debug("lease held elsewhere, skipping")
 		return
 	}
@@ -335,10 +357,19 @@ func (w *Worker) processMessage(
 		return fmt.Errorf("run agent: %w", err)
 	}
 
-	reply, runErr := w.consumeEvents(ctx, log, rc, events)
+	reply, usage, runErr := w.consumeEvents(ctx, log, rc, events)
+	w.metrics.AgentRun(ctx, started, runErr)
+
+	// Audit every run, not only refusals. The trail has to answer why the
+	// platform allowed something as well as why it refused: a record that
+	// exists only on denial cannot show that a tenant did use an agent at a
+	// given time, which is the question a compliance review actually asks.
+	w.auditRun(ctx, rc, runtime, started, usage, runErr)
+
 	if runErr != nil {
 		return runErr
 	}
+	w.recordUsage(ctx, log, rc, runtime, usage, time.Since(started))
 	log.Info("agent run finished", "latency_ms", time.Since(started).Milliseconds(),
 		"reply_chars", len([]rune(reply)))
 
@@ -354,7 +385,9 @@ func (w *Worker) processMessage(
 	// Delivery is a separate phase from execution. Once the agent has run,
 	// a delivery failure must retry only the delivery — rerunning would
 	// repeat every tool call.
-	if err := w.deliver(ctx, log, sess, msg, reply); err != nil {
+	deliverErr := w.deliver(ctx, log, sess, msg, reply)
+	w.metrics.Delivery(ctx, sess.Channel, deliverErr)
+	if err := deliverErr; err != nil {
 		if updErr := w.store.UpdateInboundState(ctx, msg.ChannelBindingID, msg.ExternalEventID,
 			types.StateDeliveryFailed, applog.Scrub(err.Error())); updErr != nil {
 			log.Error("marking delivery_failed failed", "error", applog.Scrub(updErr.Error()))
@@ -383,11 +416,12 @@ func (w *Worker) consumeEvents(
 	log *slog.Logger,
 	rc *types.RequestContext,
 	events <-chan *event.Event,
-) (string, error) {
+) (string, *model.Usage, error) {
 	var (
 		reply    strings.Builder
 		runError error
 		toolCall int
+		usage    *model.Usage
 	)
 
 	for e := range events {
@@ -397,6 +431,10 @@ func (w *Worker) consumeEvents(
 		if e.Response.Error != nil {
 			runError = fmt.Errorf("model error: %s", e.Response.Error.Message)
 			continue // keep draining
+		}
+		// Usage arrives on the settled response, not on partial chunks.
+		if e.Response.Usage != nil {
+			usage = e.Response.Usage
 		}
 
 		for _, choice := range e.Response.Choices {
@@ -425,15 +463,139 @@ func (w *Worker) consumeEvents(
 	}
 
 	if runError != nil {
-		return "", runError
+		return "", usage, runError
 	}
 	if reply.Len() == 0 {
-		return "", errors.New("agent produced no reply")
+		return "", usage, errors.New("agent produced no reply")
 	}
 	if toolCall > 0 {
 		log.Info("tools used in this turn", "count", toolCall)
 	}
-	return reply.String(), nil
+	return reply.String(), usage, nil
+}
+
+// auditRun records one agent execution in the audit trail.
+//
+// Written through the async sink: an audit write must not add database
+// latency to every reply. Records that must be durable before an effect —
+// dangerous tool intent — bypass the sink and are written by the guardrail
+// itself.
+func (w *Worker) auditRun(
+	ctx context.Context,
+	rc *types.RequestContext,
+	runtime *types.Runtime,
+	started time.Time,
+	usage *model.Usage,
+	runErr error,
+) {
+	if w.audit == nil {
+		return
+	}
+
+	r := types.NewAuditRecord(rc, types.AuditAgentRun)
+	r.LatencyMS = time.Since(started).Milliseconds()
+	if runtime != nil {
+		r.AgentName = runtime.Key.String()
+		if runtime.Spec != nil && usage != nil {
+			r.CostUSD = estimateCost(runtime.Spec.ModelName, usage.PromptTokens, usage.CompletionTokens)
+		}
+	}
+	if runErr != nil {
+		r.Decision = types.DecisionError
+		r.ErrorType = errorType(runErr)
+		r.Reason = applog.Scrub(runErr.Error())
+	}
+	if usage != nil {
+		r.Detail = map[string]any{
+			"prompt_tokens":     usage.PromptTokens,
+			"completion_tokens": usage.CompletionTokens,
+			"total_tokens":      usage.TotalTokens,
+		}
+	}
+	if err := w.audit.Write(ctx, r); err != nil {
+		w.log.Error("audit write failed", "error", applog.Scrub(err.Error()))
+	}
+}
+
+// errorType classifies a failure coarsely, so an alert can group by cause
+// without parsing free-form messages.
+func errorType(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "context deadline exceeded"):
+		return "timeout"
+	case strings.Contains(msg, "context canceled"):
+		return "cancelled"
+	case strings.Contains(msg, "model error"):
+		return "model"
+	case strings.Contains(msg, "no reply"):
+		return "empty_reply"
+	default:
+		return "internal"
+	}
+}
+
+// recordUsage writes token and cost detail and feeds the token metric.
+//
+// The ledger write is best-effort: losing an accounting row must not fail a
+// reply the user has already been promised. Enforcement does not depend on it
+// either — that reads the Redis counter, which the budget guardrail updates
+// on its own.
+func (w *Worker) recordUsage(
+	ctx context.Context,
+	log *slog.Logger,
+	rc *types.RequestContext,
+	runtime *types.Runtime,
+	usage *model.Usage,
+	elapsed time.Duration,
+) {
+	if usage == nil {
+		return
+	}
+	modelName := ""
+	if runtime != nil && runtime.Spec != nil {
+		modelName = runtime.Spec.ModelName
+	}
+
+	cost := estimateCost(modelName, usage.PromptTokens, usage.CompletionTokens)
+	w.metrics.Tokens(ctx, modelName, usage.PromptTokens, usage.CompletionTokens, cost)
+
+	if w.usage == nil {
+		return
+	}
+	if err := w.usage.WriteUsage(ctx, &types.UsageRecord{
+		TenantID: rc.TenantID, AgentAppID: rc.AgentAppID, AgentVersion: rc.AgentVersion,
+		SessionID: rc.SessionID, RequestID: rc.RequestID, TraceID: rc.TraceID,
+		ModelName:        modelName,
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		TotalTokens:      usage.TotalTokens,
+		CostUSD:          cost,
+		LatencyMS:        elapsed.Milliseconds(),
+	}); err != nil {
+		log.Error("usage record write failed", "error", applog.Scrub(err.Error()))
+	}
+}
+
+// pricePer1KTokens is the per-model rate used to turn tokens into money.
+//
+// Cost is computed and stored at record time rather than derived on read, so a
+// later price change does not silently rewrite historical spend. An unknown
+// model yields zero rather than a guess: a wrong number in a billing figure is
+// worse than an absent one.
+var pricePer1KTokens = map[string]struct{ prompt, completion float64 }{
+	"deepseek-chat":     {0.00014, 0.00028},
+	"deepseek-reasoner": {0.00055, 0.00219},
+	"gpt-4o":            {0.0025, 0.01},
+	"gpt-4o-mini":       {0.00015, 0.0006},
+}
+
+func estimateCost(model string, prompt, completion int) float64 {
+	p, ok := pricePer1KTokens[model]
+	if !ok {
+		return 0
+	}
+	return float64(prompt)/1000*p.prompt + float64(completion)/1000*p.completion
 }
 
 // deliver sends the reply back through the originating channel.

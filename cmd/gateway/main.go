@@ -24,6 +24,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	applog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/scheduler"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/store"
 )
@@ -85,6 +86,7 @@ func run() error {
 		Dispatcher: sched,
 		Mailbox:    sched,
 		Channels:   registry,
+		Metrics:    metrics.NewRecorder(metrics.NewRegistry()),
 		Logger:     logger,
 	})
 	if err != nil {

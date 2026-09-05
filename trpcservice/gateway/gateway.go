@@ -28,6 +28,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	applog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/store"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/types"
 )
@@ -39,6 +40,7 @@ type Deps struct {
 	Dispatcher types.SessionDispatcher
 	Mailbox    types.SessionMailbox
 	Channels   *channels.Registry
+	Metrics    *metrics.Recorder
 	Logger     *slog.Logger
 }
 
@@ -49,6 +51,7 @@ type Gateway struct {
 	dispatcher types.SessionDispatcher
 	mailbox    types.SessionMailbox
 	channels   *channels.Registry
+	metrics    *metrics.Recorder
 	log        *slog.Logger
 }
 
@@ -70,9 +73,15 @@ func New(d Deps) (*Gateway, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	rec := d.Metrics
+	if rec == nil {
+		// A no-op recorder rather than nil checks at every call site:
+		// instrumentation must never be the reason a request fails.
+		rec = metrics.NewRecorder(metrics.NewRegistry())
+	}
 	return &Gateway{
 		cfg: d.Config, store: d.Store, dispatcher: d.Dispatcher,
-		mailbox: d.Mailbox, channels: d.Channels, log: logger,
+		mailbox: d.Mailbox, channels: d.Channels, metrics: rec, log: logger,
 	}, nil
 }
 
@@ -87,6 +96,7 @@ func (g *Gateway) Router() *gin.Engine {
 	r.Use(gin.Recovery())
 
 	r.GET("/healthz", g.handleHealth)
+	r.GET("/metrics", gin.WrapF(g.metrics.Registry().Handler()))
 	r.Any("/webhook/*path", g.handleWebhook)
 	return r
 }
@@ -136,6 +146,7 @@ func (g *Gateway) handleWebhook(c *gin.Context) {
 	// 2. Verify before decoding: an unverified body may be attacker-supplied.
 	if err := ch.Verify(c.Request, binding); err != nil {
 		log.Warn("verification failed", "error", applog.Scrub(err.Error()))
+		g.metrics.InboundRejected(ctx, binding.Channel, binding.TenantID, "verification")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "verification failed"})
 		return
 	}
@@ -144,6 +155,7 @@ func (g *Gateway) handleWebhook(c *gin.Context) {
 	messages, err := ch.Decode(ctx, c.Request, binding)
 	if err != nil {
 		log.Warn("decode failed", "error", applog.Scrub(err.Error()))
+		g.metrics.InboundRejected(ctx, binding.Channel, binding.TenantID, "decode")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "malformed payload"})
 		return
 	}
@@ -310,6 +322,7 @@ func (g *Gateway) enqueue(ctx context.Context, log *slog.Logger, items []accepte
 			l.Error("publish hint failed", "error", applog.Scrub(err.Error()))
 			continue
 		}
+		g.metrics.InboundReceived(ctx, item.msg.Channel, item.hint.TenantID)
 		l.Info("message queued")
 	}
 }
