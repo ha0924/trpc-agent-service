@@ -36,6 +36,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	applog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/scheduler"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/store"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/types"
@@ -54,7 +55,23 @@ type Deps struct {
 	Usage      UsageSink
 	Audit      types.AuditSink
 	Tracer     *telemetry.Provider
+	DeadLetter DeadLetterSink
 	Logger     *slog.Logger
+}
+
+// DeadLetterSink bounds how often one message may be retried and holds the
+// ones that exhaust their budget.
+//
+// Without it a message that always fails is retried forever and every later
+// message in that conversation waits behind it — the session is dead while
+// looking merely slow.
+type DeadLetterSink interface {
+	// RecordAttempt increments and returns the try count for a message.
+	RecordAttempt(ctx context.Context, requestID string) (int, error)
+	// ClearAttempts drops the counter once a message succeeds.
+	ClearAttempts(ctx context.Context, requestID string) error
+	// PushDeadLetter parks a message that exhausted its budget.
+	PushDeadLetter(ctx context.Context, sessionID string, dl *scheduler.DeadLetter) error
 }
 
 // UsageSink persists token and cost detail for reconciliation. Separate from
@@ -76,6 +93,7 @@ type Worker struct {
 	usage      UsageSink
 	audit      types.AuditSink
 	tracer     *telemetry.Provider
+	deadLetter DeadLetterSink
 	log        *slog.Logger
 
 	// id identifies this process as a lease owner. Two Workers on one host
@@ -132,7 +150,7 @@ func New(d Deps) (*Worker, error) {
 		cfg: d.Config, store: d.Store, dispatcher: d.Dispatcher,
 		mailbox: d.Mailbox, lease: d.Lease, runtimes: d.Runtimes,
 		channels: d.Channels, metrics: rec, usage: d.Usage, audit: d.Audit,
-		tracer: d.Tracer, log: logger, id: id,
+		tracer: d.Tracer, deadLetter: d.DeadLetter, log: logger, id: id,
 		slots: make(chan struct{}, d.Config.Worker.Concurrency),
 	}, nil
 }
@@ -314,7 +332,7 @@ func (w *Worker) drainMailbox(ctx context.Context, log *slog.Logger, hint types.
 		if err := w.processMessage(ctx, log, hint, msg); err != nil {
 			log.Error("message processing failed",
 				"request_id", msg.RequestID, "error", applog.Scrub(err.Error()))
-			w.recordFailure(ctx, log, msg, err)
+			w.recordFailure(ctx, log, hint.SessionID, msg, err)
 			// Keep draining. A single failing message must not block every
 			// later message in this conversation.
 			continue
@@ -439,6 +457,13 @@ func (w *Worker) processMessage(
 	if err := w.store.UpdateInboundState(ctx, msg.ChannelBindingID, msg.ExternalEventID,
 		types.StateSucceeded, ""); err != nil {
 		log.Error("marking succeeded failed", "error", applog.Scrub(err.Error()))
+	}
+	// Drop the retry counter, so a conversation that recovers does not carry
+	// a stale budget into its next failure.
+	if w.deadLetter != nil {
+		if err := w.deadLetter.ClearAttempts(ctx, msg.RequestID); err != nil {
+			log.Warn("clearing attempt counter failed", "error", applog.Scrub(err.Error()))
+		}
 	}
 	return nil
 }
@@ -712,18 +737,64 @@ func splitText(s string, limit int) []string {
 	return out
 }
 
-// recordFailure marks a message failed, giving up after the configured number
-// of attempts.
+// recordFailure handles a message that could not be processed.
 //
 // Bounding attempts is what keeps one poison message from blocking a
-// conversation forever: past the bound it becomes a terminal failure and the
-// drain continues with the next message.
-func (w *Worker) recordFailure(ctx context.Context, log *slog.Logger, msg *types.InboundMessage, cause error) {
+// conversation forever. Below the bound the message is left for a later
+// attempt; at the bound it is parked in the dead letter and the drain
+// continues, so later messages in the same session are served.
+//
+// Note what is *not* done here: the message is never silently discarded. A
+// dropped message looks identical to a message that was never sent, and there
+// is then nothing to diagnose.
+func (w *Worker) recordFailure(ctx context.Context, log *slog.Logger, sessionID string, msg *types.InboundMessage, cause error) {
+	// A fresh context: the round's may already be cancelled, and losing the
+	// failure record is worse than the failure.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 
+	reason := applog.Scrub(cause.Error())
+
+	if w.deadLetter == nil {
+		// No sink configured: fall back to marking terminal, which is the
+		// pre-dead-letter behaviour.
+		if err := w.store.UpdateInboundState(ctx, msg.ChannelBindingID, msg.ExternalEventID,
+			types.StateFailed, reason); err != nil {
+			log.Error("recording failure failed", "error", applog.Scrub(err.Error()))
+		}
+		return
+	}
+
+	attempts, err := w.deadLetter.RecordAttempt(ctx, msg.RequestID)
+	if err != nil {
+		log.Error("counting attempt failed", "error", applog.Scrub(err.Error()))
+		attempts = w.cfg.Scheduler.MaxMessageAttempts // fail closed: park it
+	}
+
+	if attempts < w.cfg.Scheduler.MaxMessageAttempts {
+		log.Warn("message failed, will be retried",
+			"attempt", attempts, "max", w.cfg.Scheduler.MaxMessageAttempts, "reason", reason)
+		// Left in processing: the sweep of stale rows picks it up, so a
+		// transient fault does not need a retry loop here.
+		return
+	}
+
+	if err := w.deadLetter.PushDeadLetter(ctx, sessionID, &scheduler.DeadLetter{
+		Message:   msg,
+		Attempts:  attempts,
+		LastError: reason,
+		FailedAt:  time.Now(),
+		WorkerID:  w.id,
+	}); err != nil {
+		log.Error("pushing dead letter failed", "error", applog.Scrub(err.Error()))
+	}
+
 	if err := w.store.UpdateInboundState(ctx, msg.ChannelBindingID, msg.ExternalEventID,
-		types.StateFailed, applog.Scrub(cause.Error())); err != nil {
+		types.StateFailed, reason); err != nil {
 		log.Error("recording failure failed", "error", applog.Scrub(err.Error()))
 	}
+
+	w.metrics.DeadLettered(msg.TenantID, msg.Channel)
+	log.Error("message moved to dead letter after exhausting retries",
+		"attempts", attempts, "reason", reason)
 }

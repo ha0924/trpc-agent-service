@@ -48,6 +48,7 @@ const (
 	MetricRuntimeCached   = "agent_runtime_cached"
 	MetricLeaseContention = "agent_lease_contention_total"
 	MetricAuditDropped    = "agent_audit_dropped_total"
+	MetricDeadLettered    = "agent_dead_lettered_total"
 )
 
 // Labels identify one time series. Only bounded dimensions belong here.

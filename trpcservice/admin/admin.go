@@ -19,6 +19,7 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -28,22 +29,31 @@ import (
 	"github.com/gin-gonic/gin"
 
 	applog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/scheduler"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/store"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/types"
 )
 
+// DeadLetterStore exposes parked messages for inspection and replay.
+type DeadLetterStore interface {
+	ListDeadLetters(ctx context.Context, sessionID string, limit int64) ([]scheduler.DeadLetter, error)
+	DeadLetterCount(ctx context.Context, sessionID string) (int64, error)
+	ReplayDeadLetter(ctx context.Context, sessionID string) (*types.InboundMessage, error)
+}
+
 // API serves the admin endpoints.
 type API struct {
-	store *store.Store
-	log   *slog.Logger
+	store      *store.Store
+	deadLetter DeadLetterStore
+	log        *slog.Logger
 }
 
 // New builds the API.
-func New(s *store.Store, logger *slog.Logger) *API {
+func New(s *store.Store, dl DeadLetterStore, logger *slog.Logger) *API {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &API{store: s, log: logger}
+	return &API{store: s, deadLetter: dl, log: logger}
 }
 
 // Register mounts the routes under /admin.
@@ -68,6 +78,61 @@ func (a *API) Register(r *gin.Engine) {
 	g.GET("/tenants/:tenant/sessions", a.listSessions)
 	g.GET("/tenants/:tenant/audit", a.listAudit)
 	g.GET("/tenants/:tenant/usage", a.usageSummary)
+
+	// Dead letters are keyed by session rather than by tenant: a parked
+	// message belongs to one conversation, and replaying it has to put it
+	// back into that conversation's mailbox.
+	g.GET("/sessions/:session/deadletters", a.listDeadLetters)
+	g.POST("/sessions/:session/deadletters/replay", a.replayDeadLetter)
+}
+
+func (a *API) listDeadLetters(c *gin.Context) {
+	if a.deadLetter == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "dead letter store not configured"})
+		return
+	}
+	session := c.Param("session")
+
+	rows, err := a.deadLetter.ListDeadLetters(c.Request.Context(), session, int64(limitFrom(c, 20)))
+	if a.fail(c, err) {
+		return
+	}
+	total, err := a.deadLetter.DeadLetterCount(c.Request.Context(), session)
+	if a.fail(c, err) {
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"session_id": session, "total": total, "dead_letters": rows})
+}
+
+// replayDeadLetter returns the oldest parked message to the mailbox.
+//
+// One per call rather than a bulk drain: a replay is only correct once the
+// cause has been fixed, and replaying a batch of messages that will all fail
+// again just refills the dead letter while burning model quota.
+func (a *API) replayDeadLetter(c *gin.Context) {
+	if a.deadLetter == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "dead letter store not configured"})
+		return
+	}
+	session := c.Param("session")
+
+	msg, err := a.deadLetter.ReplayDeadLetter(c.Request.Context(), session)
+	if a.fail(c, err) {
+		return
+	}
+	if msg == nil {
+		c.JSON(http.StatusOK, gin.H{"replayed": false, "reason": "no dead letters"})
+		return
+	}
+
+	a.log.Info("dead letter replayed",
+		"session_id", session, "request_id", msg.RequestID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"replayed":   true,
+		"request_id": msg.RequestID,
+		"note":       "queued behind any newer messages; a Worker picks it up on the next hint",
+	})
 }
 
 func (a *API) listTenants(c *gin.Context) {

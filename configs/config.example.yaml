@@ -44,6 +44,16 @@ scheduler:
   # 单条消息的最大重试次数，超过后移入死信并继续排空信箱，
   # 避免一条毒消息永久阻塞整个会话
   max_message_attempts: 3
+  # 对账扫描：重投滞留在 processing 的请求。
+  #
+  # 它同时兜住两处刻意的设计选择——队列允许丢提示、失败的消息留在 processing
+  # 而非原地重试。没有扫描，前者会静默丢消息，后者会让重试计数永不累加、
+  # max_message_attempts 永不触发。
+  #
+  # sweep_age 必须不小于 lease_ttl，否则会重投 Worker 仍在处理的工作。
+  sweep_interval: 1m
+  sweep_age: 5m
+  sweep_batch: 50
 
 # Runtime 装配与缓存
 runtime:

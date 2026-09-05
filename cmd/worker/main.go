@@ -162,6 +162,7 @@ func run() error {
 		Tracer:     tracer,
 		Usage:      db,
 		Audit:      audit,
+		DeadLetter: sched,
 		Logger:     logger,
 	})
 	if err != nil {
@@ -178,6 +179,15 @@ func run() error {
 	}()
 
 	go evictIdleRuntimes(ctx, runtimes, cfg.Runtime.IdleTTL, logger)
+
+	// The sweeper runs in every Worker. Duplicate sweeps are harmless: a row
+	// is touched before being requeued, and the session lease admits only one
+	// Worker per conversation regardless of how many hints arrive.
+	go worker.NewSweeper(worker.SweepConfig{
+		Interval: cfg.Scheduler.SweepInterval,
+		Age:      cfg.Scheduler.SweepAge,
+		Batch:    cfg.Scheduler.SweepBatch,
+	}, db, sched, sched, logger).Run(ctx)
 
 	logger.Info("worker ready", "worker_id", w.ID())
 	if err := w.Run(ctx); err != nil {

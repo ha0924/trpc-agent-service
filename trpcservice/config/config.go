@@ -86,6 +86,20 @@ type SchedulerConfig struct {
 
 	// QueueKey is the Redis list backing the dispatcher.
 	QueueKey string `yaml:"queue_key"`
+
+	// SweepInterval is how often to look for requests stranded in
+	// processing. The sweep is what makes a lossy queue acceptable and what
+	// makes MaxMessageAttempts actually fire.
+	SweepInterval time.Duration `yaml:"sweep_interval"`
+
+	// SweepAge is how long a request must sit in processing before it is
+	// treated as stranded. It must exceed the longest plausible agent run,
+	// or the sweep requeues work that is still under way.
+	SweepAge time.Duration `yaml:"sweep_age"`
+
+	// SweepBatch bounds one pass, so a large backlog is worked through
+	// gradually rather than flooding the queue in a single tick.
+	SweepBatch int `yaml:"sweep_batch"`
 }
 
 // RuntimeConfig bounds the assembled-runtime cache.
@@ -197,6 +211,9 @@ func (c *Config) applyDefaults() {
 	setDuration(&c.Scheduler.LeaseRenewInterval, 10*time.Second)
 	setInt(&c.Scheduler.MaxMessageAttempts, 3)
 	setString(&c.Scheduler.QueueKey, "agent:queue:session-hints")
+	setDuration(&c.Scheduler.SweepInterval, time.Minute)
+	setDuration(&c.Scheduler.SweepAge, 5*time.Minute)
+	setInt(&c.Scheduler.SweepBatch, 50)
 
 	setInt(&c.Runtime.CacheSize, 64)
 	setDuration(&c.Runtime.IdleTTL, 30*time.Minute)
@@ -226,6 +243,15 @@ func (c *Config) Validate() error {
 	}
 	if c.Scheduler.MaxMessageAttempts < 1 {
 		return fmt.Errorf("scheduler.max_message_attempts must be at least 1")
+	}
+
+	// A sweep age below the lease TTL would requeue work a Worker is still
+	// holding, and two Workers would then contend for the same message. The
+	// lease keeps the conversation intact, but the work is done twice.
+	if c.Scheduler.SweepAge < c.Scheduler.LeaseTTL {
+		return fmt.Errorf("scheduler.sweep_age (%s) must be at least lease_ttl (%s), "+
+			"otherwise the sweep requeues work still in progress",
+			c.Scheduler.SweepAge, c.Scheduler.LeaseTTL)
 	}
 	if c.Worker.Concurrency < 1 {
 		return fmt.Errorf("worker.concurrency must be at least 1")

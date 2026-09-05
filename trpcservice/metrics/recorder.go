@@ -157,6 +157,14 @@ func (r *Recorder) LeaseContention(tenant string) {
 	r.reg.Inc(MetricLeaseContention, Labels{Tenant: tenant})
 }
 
+// DeadLettered counts messages parked after exhausting their retries.
+//
+// Any non-zero value means some user did not get an answer, so this is an
+// alerting signal rather than a curiosity.
+func (r *Recorder) DeadLettered(tenant, channel string) {
+	r.reg.Inc(MetricDeadLettered, Labels{Tenant: tenant, Channel: channel})
+}
+
 // AuditDropped reports records discarded because the audit buffer was full.
 // Any non-zero value means the audit trail has gaps and the buffer needs
 // resizing.

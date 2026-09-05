@@ -107,6 +107,7 @@ func run() error {
 		Channels:   registry,
 		Metrics:    metrics.NewRecorder(metrics.NewRegistry()),
 		Tracer:     tracer,
+		DeadLetter: sched,
 		Logger:     logger,
 	})
 	if err != nil {

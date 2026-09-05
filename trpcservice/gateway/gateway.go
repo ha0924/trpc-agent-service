@@ -45,6 +45,7 @@ type Deps struct {
 	Channels   *channels.Registry
 	Metrics    *metrics.Recorder
 	Tracer     *telemetry.Provider
+	DeadLetter admin.DeadLetterStore
 	Logger     *slog.Logger
 }
 
@@ -57,6 +58,7 @@ type Gateway struct {
 	channels   *channels.Registry
 	metrics    *metrics.Recorder
 	tracer     *telemetry.Provider
+	deadLetter admin.DeadLetterStore
 	log        *slog.Logger
 }
 
@@ -87,7 +89,7 @@ func New(d Deps) (*Gateway, error) {
 	return &Gateway{
 		cfg: d.Config, store: d.Store, dispatcher: d.Dispatcher,
 		mailbox: d.Mailbox, channels: d.Channels, metrics: rec,
-		tracer: d.Tracer, log: logger,
+		tracer: d.Tracer, deadLetter: d.DeadLetter, log: logger,
 	}, nil
 }
 
@@ -107,7 +109,7 @@ func (g *Gateway) Router() *gin.Engine {
 	// The control-plane API lives here because Gateway is already the process
 	// with a public listener and a database connection; Workers expose
 	// nothing callable.
-	admin.New(g.store, g.log).Register(r)
+	admin.New(g.store, g.deadLetter, g.log).Register(r)
 
 	r.Any("/webhook/*path", g.handleWebhook)
 	return r
