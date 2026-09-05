@@ -26,6 +26,7 @@ import (
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecom"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	applog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
@@ -127,6 +128,11 @@ func run() error {
 
 	registry := channels.NewRegistry()
 	registry.Register(mock.Name, mock.New(cfg.ResolveSecret, mock.WithReplyURL(*replyURL)))
+	// The token manager shares the scheduler's Redis: access tokens need the
+	// same distributed lock semantics as session leases, and keeping them in
+	// one place means one connection to reason about.
+	registry.Register(wecom.Name,
+		wecom.New(cfg.ResolveSecret, wecom.NewTokenManager(sched.Client(), logger), logger))
 	logger.Info("channels registered", "channels", registry.Names(), "reply_url", *replyURL)
 
 	w, err := worker.New(worker.Deps{

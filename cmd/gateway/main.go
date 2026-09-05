@@ -21,6 +21,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecom"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	applog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
@@ -78,6 +79,9 @@ func run() error {
 
 	registry := channels.NewRegistry()
 	registry.Register(mock.Name, mock.New(cfg.ResolveSecret))
+	// Gateway only ever needs the inbound half: it verifies and decodes, and
+	// never pushes, so no token manager is wired here.
+	registry.RegisterInbound(wecom.Name, wecom.New(cfg.ResolveSecret, nil, logger))
 	logger.Info("channels registered", "channels", registry.Names())
 
 	gw, err := gateway.New(gateway.Deps{

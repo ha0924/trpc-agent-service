@@ -82,6 +82,9 @@ secrets:
   mapping:
     "secret://prod/tenant-demo/model/primary-api-key": DEEPSEEK_API_KEY
     "secret://prod/tenant-demo/channel/mock-token": MOCK_CHANNEL_TOKEN
+    # 企业微信的凭据是一个 JSON 块，含 corp_id / secret / agent_id /
+    # token / encoding_aes_key。整体存在密钥管理器里，库中只留引用。
+    "secret://prod/tenant-demo/channel/wecom": WECOM_CREDENTIALS
 
 # 模型服务端点。DeepSeek 兼容 OpenAI 协议，走同一个 client。
 models:
