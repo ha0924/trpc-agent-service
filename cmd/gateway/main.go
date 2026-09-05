@@ -28,6 +28,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/scheduler"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/store"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 )
 
 func main() {
@@ -60,6 +61,20 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Started before any connection: the W3C propagator must be installed
+	// even with export disabled, or context would stop crossing the queue.
+	tracer, err := telemetry.Start(ctx, cfg, "gateway", logger)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// Flushed on the way out — the spans describing a failure are the
+		// ones still buffered when the process is asked to stop.
+		if err := tracer.Shutdown(); err != nil {
+			logger.Warn("flushing traces failed", "error", err.Error())
+		}
+	}()
+
 	startupCtx, cancelStartup := context.WithTimeout(ctx, 15*time.Second)
 	defer cancelStartup()
 
@@ -91,6 +106,7 @@ func run() error {
 		Mailbox:    sched,
 		Channels:   registry,
 		Metrics:    metrics.NewRecorder(metrics.NewRegistry()),
+		Tracer:     tracer,
 		Logger:     logger,
 	})
 	if err != nil {

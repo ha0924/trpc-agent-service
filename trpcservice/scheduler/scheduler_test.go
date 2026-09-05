@@ -197,6 +197,12 @@ func TestPublishSubscribeRoundTrip(t *testing.T) {
 	want := types.SessionHint{
 		TenantID: "tenant-demo", AgentAppID: "assistant",
 		AgentVersion: "v1", SessionID: "sess-1", TraceID: "trace-1",
+		// The W3C context has to survive the round trip: without it the
+		// consumer starts a new root span and one message yields two
+		// disconnected traces instead of one tree.
+		TraceContext: map[string]string{
+			"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		},
 	}
 	if err := r.Publish(ctx, want); err != nil {
 		t.Fatalf("Publish: %v", err)
@@ -204,8 +210,13 @@ func TestPublishSubscribeRoundTrip(t *testing.T) {
 
 	select {
 	case got := <-hints:
-		if got != want {
-			t.Errorf("got %+v, want %+v", got, want)
+		if got.SessionID != want.SessionID || got.TenantID != want.TenantID ||
+			got.AgentVersion != want.AgentVersion || got.TraceID != want.TraceID {
+			t.Errorf("identity fields changed:\n got %+v\nwant %+v", got, want)
+		}
+		if got.TraceContext["traceparent"] != want.TraceContext["traceparent"] {
+			t.Errorf("traceparent lost in transit: got %q, want %q",
+				got.TraceContext["traceparent"], want.TraceContext["traceparent"])
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for hint")

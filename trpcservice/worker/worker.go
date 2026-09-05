@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 
@@ -36,6 +37,7 @@ import (
 	applog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/store"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/types"
 )
 
@@ -51,6 +53,7 @@ type Deps struct {
 	Metrics    *metrics.Recorder
 	Usage      UsageSink
 	Audit      types.AuditSink
+	Tracer     *telemetry.Provider
 	Logger     *slog.Logger
 }
 
@@ -72,6 +75,7 @@ type Worker struct {
 	metrics    *metrics.Recorder
 	usage      UsageSink
 	audit      types.AuditSink
+	tracer     *telemetry.Provider
 	log        *slog.Logger
 
 	// id identifies this process as a lease owner. Two Workers on one host
@@ -128,7 +132,7 @@ func New(d Deps) (*Worker, error) {
 		cfg: d.Config, store: d.Store, dispatcher: d.Dispatcher,
 		mailbox: d.Mailbox, lease: d.Lease, runtimes: d.Runtimes,
 		channels: d.Channels, metrics: rec, usage: d.Usage, audit: d.Audit,
-		log: logger, id: id,
+		tracer: d.Tracer, log: logger, id: id,
 		slots: make(chan struct{}, d.Config.Worker.Concurrency),
 	}, nil
 }
@@ -195,6 +199,17 @@ func (w *Worker) drain() {
 
 // handleHint runs one round for one session.
 func (w *Worker) handleHint(ctx context.Context, hint types.SessionHint) {
+	// Continue the trace the Gateway started. The hint carries the full W3C
+	// context, not just the id, so this span becomes a child of the inbound
+	// span rather than the root of a second tree.
+	ctx = telemetry.Extract(ctx, hint.TraceContext)
+	ctx, span := w.tracer.StartSpan(ctx, "worker.round",
+		attribute.String("tenant.id", hint.TenantID),
+		attribute.String("agent.app_id", hint.AgentAppID),
+		attribute.String("session.id", hint.SessionID),
+		attribute.String("worker.id", w.id))
+	defer span.End()
+
 	log := w.log.With(
 		"worker_id", w.id,
 		"tenant_id", hint.TenantID,
@@ -204,12 +219,18 @@ func (w *Worker) handleHint(ctx context.Context, hint types.SessionHint) {
 
 	won, err := w.lease.Acquire(ctx, hint.SessionID, w.id)
 	if err != nil {
+		telemetry.RecordError(span, err)
 		log.Error("acquire lease failed", "error", applog.Scrub(err.Error()))
 		return
 	}
+	span.SetAttributes(attribute.Bool("lease.won", won))
 	if !won {
 		// Expected under at-least-once delivery: another Worker owns this
 		// session right now and will drain it, including our message.
+		// Recorded as an attribute rather than an error — a lost race is
+		// the design working, and marking it an error would make healthy
+		// traces look broken.
+		span.SetAttributes(attribute.Bool("lease.won", false))
 		w.metrics.LeaseContention(hint.TenantID)
 		log.Debug("lease held elsewhere, skipping")
 		return
@@ -308,8 +329,14 @@ func (w *Worker) processMessage(
 	hint types.SessionHint,
 	msg *types.InboundMessage,
 ) error {
+	ctx, span := w.tracer.StartSpan(ctx, "worker.message",
+		attribute.String("request.id", msg.RequestID),
+		attribute.String("channel", msg.Channel))
+	defer span.End()
+
 	sess, err := w.store.SessionByID(ctx, msg.TenantID, hint.SessionID)
 	if err != nil {
+		telemetry.RecordError(span, err)
 		return fmt.Errorf("load session: %w", err)
 	}
 
@@ -359,6 +386,14 @@ func (w *Worker) processMessage(
 
 	reply, usage, runErr := w.consumeEvents(ctx, log, rc, events)
 	w.metrics.AgentRun(ctx, started, runErr)
+	if runErr != nil {
+		telemetry.RecordError(span, runErr)
+	}
+	if usage != nil {
+		span.SetAttributes(
+			attribute.Int("model.prompt_tokens", usage.PromptTokens),
+			attribute.Int("model.completion_tokens", usage.CompletionTokens))
+	}
 
 	// Audit every run, not only refusals. The trail has to answer why the
 	// platform allowed something as well as why it refused: a record that
@@ -385,7 +420,13 @@ func (w *Worker) processMessage(
 	// Delivery is a separate phase from execution. Once the agent has run,
 	// a delivery failure must retry only the delivery — rerunning would
 	// repeat every tool call.
-	deliverErr := w.deliver(ctx, log, sess, msg, reply)
+	deliverCtx, deliverSpan := w.tracer.StartSpan(ctx, "worker.deliver",
+		attribute.String("channel", sess.Channel))
+	deliverErr := w.deliver(deliverCtx, log, sess, msg, reply)
+	if deliverErr != nil {
+		telemetry.RecordError(deliverSpan, deliverErr)
+	}
+	deliverSpan.End()
 	w.metrics.Delivery(ctx, sess.Channel, deliverErr)
 	if err := deliverErr; err != nil {
 		if updErr := w.store.UpdateInboundState(ctx, msg.ChannelBindingID, msg.ExternalEventID,

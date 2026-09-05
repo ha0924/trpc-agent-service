@@ -100,6 +100,16 @@ log:
   # text 便于本地阅读，json 便于采集
   format: text
 
-# 一期不接 Collector，仅要求 trace_id 贯穿两个进程的日志
+# OpenTelemetry。
+#
+# enabled 只控制导出：即使为 false，W3C trace context 仍会随 SessionHint 穿过
+# 队列，因此打开导出不会是这套传播逻辑第一次运行。
+#
+# 本机观察可用 scripts/otlp_receiver.py 顶一个最小接收器：
+#   python3 scripts/otlp_receiver.py 4318
 telemetry:
   enabled: false
+  protocol: http                      # grpc 或 http
+  endpoint: "127.0.0.1:4318"
+  service_namespace: trpc-agent-platform
+  service_version: "0.1.0"

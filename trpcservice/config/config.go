@@ -142,9 +142,21 @@ type LogConfig struct {
 }
 
 // TelemetryConfig configures OpenTelemetry export.
+//
+// Enabled gates only the exporter. Trace context still propagates across the
+// queue when it is false, so switching export on in production is not the
+// first time that plumbing runs.
 type TelemetryConfig struct {
-	Enabled  bool   `yaml:"enabled"`
+	Enabled bool `yaml:"enabled"`
+	// Endpoint is the OTLP collector address. Empty falls back to the
+	// OTEL_EXPORTER_OTLP_ENDPOINT environment variable.
 	Endpoint string `yaml:"endpoint"`
+	// Protocol is grpc or http.
+	Protocol string `yaml:"protocol"`
+	// ServiceNamespace and ServiceVersion label every span, so traces from
+	// two deployments of this platform stay distinguishable in one backend.
+	ServiceNamespace string `yaml:"service_namespace"`
+	ServiceVersion   string `yaml:"service_version"`
 }
 
 // Load reads and validates the configuration at path.
@@ -190,6 +202,8 @@ func (c *Config) applyDefaults() {
 	setDuration(&c.Runtime.IdleTTL, 30*time.Minute)
 
 	setString(&c.Secrets.Resolver, "env")
+	setString(&c.Telemetry.Protocol, "grpc")
+	setString(&c.Telemetry.ServiceNamespace, "trpc-agent-platform")
 	setString(&c.Log.Level, "info")
 	setString(&c.Log.Format, "text")
 }

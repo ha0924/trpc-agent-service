@@ -24,6 +24,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/admin"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
@@ -31,6 +32,7 @@ import (
 	applog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/metrics"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/store"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/types"
 )
 
@@ -42,6 +44,7 @@ type Deps struct {
 	Mailbox    types.SessionMailbox
 	Channels   *channels.Registry
 	Metrics    *metrics.Recorder
+	Tracer     *telemetry.Provider
 	Logger     *slog.Logger
 }
 
@@ -53,6 +56,7 @@ type Gateway struct {
 	mailbox    types.SessionMailbox
 	channels   *channels.Registry
 	metrics    *metrics.Recorder
+	tracer     *telemetry.Provider
 	log        *slog.Logger
 }
 
@@ -82,7 +86,8 @@ func New(d Deps) (*Gateway, error) {
 	}
 	return &Gateway{
 		cfg: d.Config, store: d.Store, dispatcher: d.Dispatcher,
-		mailbox: d.Mailbox, channels: d.Channels, metrics: rec, log: logger,
+		mailbox: d.Mailbox, channels: d.Channels, metrics: rec,
+		tracer: d.Tracer, log: logger,
 	}, nil
 }
 
@@ -121,14 +126,33 @@ func (g *Gateway) handleHealth(c *gin.Context) {
 
 // handleWebhook is the single entry point for every channel.
 func (g *Gateway) handleWebhook(c *gin.Context) {
-	ctx := c.Request.Context()
-	traceID := traceIDFrom(c.Request)
+	// The span opens before anything else, so even a request rejected at the
+	// binding lookup shows up in the trace. A callback that 404s is exactly
+	// the kind of thing someone comes to a trace to explain.
+	//
+	// Any upstream traceparent is honoured, so a trace started at the IM
+	// platform's edge continues here rather than being replaced.
+	ctx := telemetry.Extract(c.Request.Context(), headerCarrier(c.Request))
+	ctx, span := g.tracer.StartSpan(ctx, "gateway.inbound",
+		attribute.String("http.route", c.Request.URL.Path),
+		attribute.String("http.method", c.Request.Method))
+	defer span.End()
+
+	// The trace id comes from the span, not from a fresh uuid: a log line and
+	// a span have to carry the same value or they cannot be joined.
+	traceID := telemetry.TraceIDFrom(ctx)
+	if traceID == "" {
+		// Tracing is disabled, so no span context exists. Fall back to a
+		// generated id — logs still need something to correlate on.
+		traceID = "trace-" + uuid.NewString()
+	}
 
 	// 1. Resolve the binding. This is where the request acquires its tenant:
 	//    the payload is untrusted and must not be able to name its own.
 	binding, err := g.store.ChannelBindingByWebhook(ctx, c.Request.URL.Path)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
+			span.SetAttributes(attribute.String("reject.reason", "unknown_webhook"))
 			g.log.Warn("unknown webhook path", "path", c.Request.URL.Path, "trace_id", traceID)
 			c.JSON(http.StatusNotFound, gin.H{"error": "unknown webhook"})
 			return
@@ -138,6 +162,12 @@ func (g *Gateway) handleWebhook(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
 		return
 	}
+
+	span.SetAttributes(
+		attribute.String("tenant.id", binding.TenantID),
+		attribute.String("agent.app_id", binding.AgentAppID),
+		attribute.String("channel", binding.Channel),
+		attribute.String("channel.binding_id", binding.ChannelBindingID))
 
 	log := g.log.With("tenant_id", binding.TenantID, "agent_app_id", binding.AgentAppID,
 		"channel", binding.Channel, "channel_binding_id", binding.ChannelBindingID,
@@ -153,6 +183,7 @@ func (g *Gateway) handleWebhook(c *gin.Context) {
 	// 2. Verify before decoding: an unverified body may be attacker-supplied.
 	if err := ch.Verify(c.Request, binding); err != nil {
 		log.Warn("verification failed", "error", applog.Scrub(err.Error()))
+		telemetry.RecordError(span, err)
 		g.metrics.InboundRejected(ctx, binding.Channel, binding.TenantID, "verification")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "verification failed"})
 		return
@@ -162,6 +193,7 @@ func (g *Gateway) handleWebhook(c *gin.Context) {
 	messages, err := ch.Decode(ctx, c.Request, binding)
 	if err != nil {
 		log.Warn("decode failed", "error", applog.Scrub(err.Error()))
+		telemetry.RecordError(span, err)
 		g.metrics.InboundRejected(ctx, binding.Channel, binding.TenantID, "decode")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "malformed payload"})
 		return
@@ -299,6 +331,9 @@ func (g *Gateway) admit(
 			AgentVersion: rc.AgentVersion,
 			SessionID:    rc.SessionID,
 			TraceID:      rc.TraceID,
+			// The W3C context, not just the id: it is what lets the Worker's
+			// spans hang off this one instead of forming a second tree.
+			TraceContext: telemetry.Inject(ctx),
 		},
 	}, nil
 }
@@ -346,13 +381,14 @@ func internalUserID(msg *types.InboundMessage) string {
 	return msg.ExternalUserID
 }
 
-// traceIDFrom reuses an upstream trace id when the caller supplies one, so a
-// trace started at the IM platform's edge survives into our logs.
-func traceIDFrom(r *http.Request) string {
-	for _, h := range []string{"X-Trace-Id", "X-Request-Id", "Traceparent"} {
+// headerCarrier exposes the request headers as a trace carrier, so an
+// upstream traceparent continues into this trace instead of being discarded.
+func headerCarrier(r *http.Request) telemetry.Carrier {
+	c := make(telemetry.Carrier, 2)
+	for _, h := range []string{"traceparent", "tracestate"} {
 		if v := r.Header.Get(h); v != "" {
-			return v
+			c[h] = v
 		}
 	}
-	return "trace-" + uuid.NewString()
+	return c
 }

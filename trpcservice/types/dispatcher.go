@@ -20,6 +20,14 @@ type SessionHint struct {
 	// it the two processes' logs cannot be joined, which is the one
 	// observability guarantee phase one must meet.
 	TraceID string `json:"trace_id"`
+
+	// TraceContext carries the W3C traceparent and tracestate headers.
+	//
+	// TraceID above is enough to join log lines, but not to join spans: a
+	// child span needs its parent's span id and the sampling decision, both of
+	// which travel here. Without it the Worker starts a new root span and one
+	// message produces two disconnected traces instead of one tree.
+	TraceContext map[string]string `json:"trace_context,omitempty"`
 }
 
 // SessionDispatcher moves pending-session hints from Gateway to Worker.
