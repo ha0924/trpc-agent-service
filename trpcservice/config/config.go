@@ -100,6 +100,13 @@ type SchedulerConfig struct {
 	// SweepBatch bounds one pass, so a large backlog is worked through
 	// gradually rather than flooding the queue in a single tick.
 	SweepBatch int `yaml:"sweep_batch"`
+
+	// MaxDeliveryAttempts bounds redelivery of one reply. Distinct from
+	// MaxMessageAttempts: that one bounds *executions*, this one bounds
+	// *deliveries* of an answer that was already produced. An undeliverable
+	// reply should stop consuming the platform's outbound allowance rather
+	// than being retried forever.
+	MaxDeliveryAttempts int `yaml:"max_delivery_attempts"`
 }
 
 // RuntimeConfig bounds the assembled-runtime cache.
@@ -214,6 +221,7 @@ func (c *Config) applyDefaults() {
 	setDuration(&c.Scheduler.SweepInterval, time.Minute)
 	setDuration(&c.Scheduler.SweepAge, 5*time.Minute)
 	setInt(&c.Scheduler.SweepBatch, 50)
+	setInt(&c.Scheduler.MaxDeliveryAttempts, 5)
 
 	setInt(&c.Runtime.CacheSize, 64)
 	setDuration(&c.Runtime.IdleTTL, 30*time.Minute)

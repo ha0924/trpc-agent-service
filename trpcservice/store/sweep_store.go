@@ -5,6 +5,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -94,4 +96,81 @@ UPDATE inbound_events SET updated_at = NOW(3)
 		return fmt.Errorf("touch inbound event %s/%s: %w", bindingID, externalEventID, err)
 	}
 	return nil
+}
+
+// FindFailedDeliveries returns requests whose agent finished but whose reply
+// never reached the user.
+//
+// This is a distinct query from FindStaleInbound because the two need opposite
+// treatment. A stranded request has to be re-executed; a failed delivery must
+// **not** be — its tools already ran and their side effects already happened.
+// Re-running it would place a second order, send a second notification, charge
+// a second time.
+//
+// The reply itself is recovered from the session's last agent message rather
+// than being stored a second time on this row: duplicating it would give two
+// copies that can disagree.
+func (s *Store) FindFailedDeliveries(ctx context.Context, age time.Duration, maxAttempts, limit int) ([]StaleInbound, error) {
+	const q = `
+SELECT tenant_id, channel_binding_id, external_event_id, request_id,
+       COALESCE(trace_id, ''), COALESCE(session_id, ''), payload, attempts, updated_at
+  FROM inbound_events
+ WHERE state = ? AND updated_at < ? AND attempts < ?
+ ORDER BY updated_at
+ LIMIT ?`
+
+	cutoff := time.Now().Add(-age)
+	rows, err := s.db.QueryContext(ctx, q, types.StateDeliveryFailed, cutoff, maxAttempts, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query failed deliveries: %w", err)
+	}
+	defer rows.Close()
+
+	var out []StaleInbound
+	for rows.Next() {
+		var (
+			si  StaleInbound
+			raw []byte
+		)
+		if err := rows.Scan(&si.TenantID, &si.ChannelBindingID, &si.ExternalEventID,
+			&si.RequestID, &si.TraceID, &si.SessionID, &raw, &si.Attempts, &si.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan failed delivery: %w", err)
+		}
+		if err := decodeJSON(raw, &si.Payload); err != nil {
+			continue
+		}
+		if si.Payload == nil || si.SessionID == "" {
+			continue
+		}
+		out = append(out, si)
+	}
+	return out, rows.Err()
+}
+
+// LastAgentReply returns the most recent agent message in a session.
+//
+// Used to redeliver a reply that was produced but not delivered. Read back
+// from session_events rather than kept on the inbound row, so there is one
+// copy of the answer and no chance of the two diverging.
+func (s *Store) LastAgentReply(ctx context.Context, tenantID, sessionID, requestID string) (string, error) {
+	const q = `
+SELECT JSON_UNQUOTE(JSON_EXTRACT(content, '$.text'))
+  FROM session_events
+ WHERE tenant_id = ? AND session_id = ? AND request_id = ? AND event_type = ?
+ ORDER BY sequence DESC
+ LIMIT 1`
+
+	var text sql.NullString
+	err := s.db.QueryRowContext(ctx, q, tenantID, sessionID, requestID,
+		types.EventTypeAgentMessage).Scan(&text)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("agent reply for request %s: %w", requestID, ErrNotFound)
+	}
+	if err != nil {
+		return "", fmt.Errorf("query agent reply for %s: %w", requestID, err)
+	}
+	if !text.Valid || text.String == "" {
+		return "", fmt.Errorf("agent reply for request %s is empty: %w", requestID, ErrNotFound)
+	}
+	return text.String, nil
 }

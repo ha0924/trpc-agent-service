@@ -48,6 +48,20 @@ type PolicyDeps struct {
 	Budget  BudgetCounter
 	Tenants TenantSettingsLoader
 	Users   ChannelUserLoader
+	// Metrics receives model and tool timings. Nil disables that recording
+	// rather than failing assembly: instrumentation must never be the reason
+	// an agent cannot be built.
+	Metrics MetricsRecorder
+}
+
+// MetricsRecorder receives the timings taken inside framework callbacks.
+//
+// An interface rather than the concrete recorder so the agent package does not
+// depend on the metrics package, and so a test can count calls.
+type MetricsRecorder interface {
+	ModelCall(ctx context.Context, model string, start time.Time, err error)
+	ToolCall(ctx context.Context, tool string, start time.Time, err error)
+	ToolDenied(ctx context.Context, tool string)
 }
 
 // BudgetCounter tracks token consumption per tenant and period.
@@ -92,6 +106,7 @@ type ExtensionRegistry struct {
 // The five governance policies required of the platform are all here, each
 // attached to a framework mount point rather than to a bespoke hook:
 //
+//	instrumentation           BeforeModel, AfterModel, BeforeTool, AfterTool
 //	tool_whitelist            BeforeTool   allow / deny / ask per version
 //	dangerous_tool_approval   BeforeTool   confirmation before side effects
 //	redaction                 BeforeModel, AfterModel, AfterTool
@@ -103,6 +118,7 @@ type ExtensionRegistry struct {
 func NewExtensionRegistry() *ExtensionRegistry {
 	r := &ExtensionRegistry{exts: make(map[string]Extension)}
 	r.Register("request_logger", requestLogger)
+	r.Register("instrumentation", instrumentation)
 	r.Register("tool_whitelist", toolWhitelist)
 	r.Register("dangerous_tool_approval", dangerousToolApproval)
 	r.Register("redaction", redaction)

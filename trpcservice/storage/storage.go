@@ -21,10 +21,12 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+	sessionmysql "trpc.group/trpc-go/trpc-agent-go/session/mysql"
 	sessionredis "trpc.group/trpc-go/trpc-agent-go/session/redis"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
@@ -35,6 +37,7 @@ import (
 const (
 	KindInMemory = "inmemory"
 	KindRedis    = "redis"
+	KindMySQL    = "mysql"
 )
 
 // ErrNoBackend means no backend serves the requested triple.
@@ -49,9 +52,61 @@ type Router struct {
 	defaults map[types.DataType]string
 	rules    []config.StorageRule
 
+	// metrics receives per-backend latency. Nil disables recording rather
+	// than requiring a nil check at each of the seventeen delegations.
+	metrics StorageMetrics
+
 	log      *slog.Logger
 	closeMu  sync.Mutex
 	isClosed bool
+}
+
+// StorageMetrics receives session backend timings.
+//
+// An interface so this package does not depend on the metrics package. The
+// backend name is part of the measurement because the whole point of routing
+// is that different tenants sit on different stores with different latency.
+type StorageMetrics interface {
+	StorageCall(ctx context.Context, backend, op string, start time.Time, err error)
+}
+
+// WithMetrics attaches a recorder.
+func (r *Router) WithMetrics(m StorageMetrics) *Router {
+	r.metrics = m
+	return r
+}
+
+// observe times one delegated call.
+//
+// Wrapping rather than repeating the timing in every method: seventeen
+// hand-written copies would drift, and a missing one shows up as a backend
+// that silently reports no latency.
+func (r *Router) observe(ctx context.Context, op string, fn func() error) error {
+	if r.metrics == nil {
+		return fn()
+	}
+	start := time.Now()
+	err := fn()
+	r.metrics.StorageCall(ctx, r.backendFor(ctx), op, start, err)
+	return err
+}
+
+// backendFor names the backend a call was routed to, for the metric label.
+// Unknown resolves to "unrouted" rather than being dropped: a call whose
+// tenant could not be determined is worth seeing.
+func (r *Router) backendFor(ctx context.Context) string {
+	tenantID, agentAppID := types.TenantID(ctx), ""
+	if rc, err := types.FromContext(ctx); err == nil {
+		agentAppID = rc.AgentAppID
+	}
+	if tenantID == "" {
+		return "unrouted"
+	}
+	ref, err := r.Resolve(ctx, tenantID, agentAppID, types.DataTypeSession)
+	if err != nil {
+		return "unrouted"
+	}
+	return ref.Name
 }
 
 var _ types.StorageRouter = (*Router)(nil)
@@ -101,6 +156,44 @@ func buildBackend(b config.BackendConfig, cfg *config.Config) (session.Service, 
 	switch b.Kind {
 	case KindInMemory:
 		return inmemory.NewSessionService(), nil
+
+	case KindMySQL:
+		// A SQL-backed session service: durable across restarts and
+		// queryable, at the cost of higher write latency than Redis. Which
+		// tenant gets which is the trade-off the router exists to express.
+		//
+		// It needs its **own** database, not the control-plane one.
+		//
+		// The framework manages its own session schema and creates a
+		// session_events table with an app_name column. The platform's
+		// data model already defines a session_events table of its own,
+		// keyed by (session_id, sequence) for ordering. Same name, different
+		// shape: pointing both at one database makes the framework's schema
+		// verification fail outright — which is how this was found, the
+		// Worker refused to start.
+		//
+		// Separate databases is the right answer rather than a workaround:
+		// the platform's table is the durable conversation history it owns,
+		// the framework's is that backend's internal storage. Conflating
+		// them would also mean a backend change could rewrite history.
+		dsn := b.DSNRef
+		if dsn == "" {
+			return nil, fmt.Errorf(
+				"backend %q needs its own dsn_ref: the framework's session schema "+
+					"collides with the platform's session_events table", b.Name)
+		}
+		resolved, err := cfg.ResolveSecret(dsn)
+		if err != nil {
+			// Not a secret reference: treat it as a literal DSN, which is
+			// what a local development config carries.
+			resolved = dsn
+		}
+		svc, err := sessionmysql.NewService(
+			sessionmysql.WithMySQLClientDSN(resolved))
+		if err != nil {
+			return nil, fmt.Errorf("mysql session service: %w", err)
+		}
+		return svc, nil
 
 	case KindRedis:
 		// The session backend reuses the same Redis the scheduler uses. They
@@ -232,7 +325,13 @@ func (r *Router) CreateSession(ctx context.Context, key session.Key, state sessi
 	if err != nil {
 		return nil, err
 	}
-	return svc.CreateSession(ctx, key, state, opts...)
+	var out *session.Session
+	err = r.observe(ctx, "create_session", func() error {
+		var e error
+		out, e = svc.CreateSession(ctx, key, state, opts...)
+		return e
+	})
+	return out, err
 }
 
 func (r *Router) GetSession(ctx context.Context, key session.Key, opts ...session.Option) (*session.Session, error) {
@@ -240,7 +339,13 @@ func (r *Router) GetSession(ctx context.Context, key session.Key, opts ...sessio
 	if err != nil {
 		return nil, err
 	}
-	return svc.GetSession(ctx, key, opts...)
+	var out *session.Session
+	err = r.observe(ctx, "get_session", func() error {
+		var e error
+		out, e = svc.GetSession(ctx, key, opts...)
+		return e
+	})
+	return out, err
 }
 
 func (r *Router) ListSessions(ctx context.Context, key session.UserKey, opts ...session.Option) ([]*session.Session, error) {
@@ -312,7 +417,9 @@ func (r *Router) UpdateSessionState(ctx context.Context, key session.Key, state 
 	if err != nil {
 		return err
 	}
-	return svc.UpdateSessionState(ctx, key, state)
+	return r.observe(ctx, "update_state", func() error {
+		return svc.UpdateSessionState(ctx, key, state)
+	})
 }
 
 func (r *Router) AppendEvent(ctx context.Context, sess *session.Session, e *event.Event, opts ...session.Option) error {
@@ -323,7 +430,9 @@ func (r *Router) AppendEvent(ctx context.Context, sess *session.Session, e *even
 	if err != nil {
 		return err
 	}
-	return svc.AppendEvent(ctx, sess, e, opts...)
+	return r.observe(ctx, "append_event", func() error {
+		return svc.AppendEvent(ctx, sess, e, opts...)
+	})
 }
 
 func (r *Router) CreateSessionSummary(ctx context.Context, sess *session.Session, filterKey string, force bool) error {

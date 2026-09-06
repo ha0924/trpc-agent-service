@@ -204,7 +204,11 @@ trpc.group/trpc-go/trpc-agent-go v1.11.2 h1:qBgrX48JXvgf+k6cq1BSWR4oPfFXxp8/boYy
 trpc.group/trpc-go/trpc-agent-go v1.11.2/go.mod h1:bIZcN4N9sGpA42sWfE98XCPl9ZgMi6fMDLGYOaXNe9A=
 trpc.group/trpc-go/trpc-agent-go/openclaw v0.0.1 h1:EaW/WWF/waMPA0VmsimGzT5N0jmQQ3pqExw0kUyoRQc=
 trpc.group/trpc-go/trpc-agent-go/openclaw v0.0.1/go.mod h1:glaew326MZurpuDMYJYW+Z6wddbET+IThbcWpDNJves=
+trpc.group/trpc-go/trpc-agent-go/session/mysql v1.11.2 h1:9Zw+2X8o6UmTyOQeRC2IW0SNoDIlIKld27oK4VviJSA=
+trpc.group/trpc-go/trpc-agent-go/session/mysql v1.11.2/go.mod h1:wOjvWOKfnxD3hEitzrOIbeRDx/gIQWLJPQm/tGX9L8A=
 trpc.group/trpc-go/trpc-agent-go/session/redis v1.11.0 h1:k9JQxmsMDCKq5F8hKGkC141ai9P+KPTDjYQEeP4J7lM=
 trpc.group/trpc-go/trpc-agent-go/session/redis v1.11.0/go.mod h1:80ouH5vO6qAKXqq+/8MrtJxI9K2mNlzRtH2L+XRr3S0=
+trpc.group/trpc-go/trpc-agent-go/storage/mysql v1.8.0 h1:ymwqc6XfcRnNsxiBYo4OHZ2FkCi65XHPKsZ4xBGwLUI=
+trpc.group/trpc-go/trpc-agent-go/storage/mysql v1.8.0/go.mod h1:5AZIZqvwR8U15gEEw64TQGSDWZgcno0M/ADkj6xKbBw=
 trpc.group/trpc-go/trpc-agent-go/storage/redis v1.8.0 h1:ZuexURGWZ+cUnlYd7JVw+KQ3QilRu7tusxPlx6GzMyc=
 trpc.group/trpc-go/trpc-agent-go/storage/redis v1.8.0/go.mod h1:aDGUkqlbGttFVGlZW2lMg5mAgurHezq5De/gAuLhV5E=

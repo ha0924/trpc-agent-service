@@ -100,11 +100,17 @@ func run() error {
 	defer sched.Close()
 	logger.Info("redis connected", "queue_key", cfg.Scheduler.QueueKey)
 
+	recorder := metrics.NewRecorder(metrics.NewRegistry())
+
 	router, err := storage.New(startupCtx, cfg, logger)
 	if err != nil {
 		return err
 	}
 	defer router.Close()
+	// Per-backend latency: the point of routing is that different tenants sit
+	// on stores with different latency, so the backend name is part of the
+	// measurement.
+	router.WithMetrics(recorder)
 
 	tools := platformtool.NewRegistry()
 	extensions := platformagent.NewExtensionRegistry()
@@ -116,8 +122,6 @@ func run() error {
 	// before a side effect — dangerous tool intent — bypass it.
 	audit := store.NewAsyncAuditSink(db, logger, 2048)
 	defer audit.Close()
-
-	recorder := metrics.NewRecorder(metrics.NewRegistry())
 
 	// The store is the spec loader: assembly reads a version's prompt, model
 	// and bindings straight from the control plane, so no agent is defined in
@@ -133,6 +137,7 @@ func run() error {
 			Budget:  budgetCounter{sched},
 			Tenants: db,
 			Users:   db,
+			Metrics: recorder,
 		},
 		Logger: logger,
 	})
@@ -163,6 +168,7 @@ func run() error {
 		Usage:      db,
 		Audit:      audit,
 		DeadLetter: sched,
+		RateLimit:  sched,
 		Logger:     logger,
 	})
 	if err != nil {
@@ -183,11 +189,14 @@ func run() error {
 	// The sweeper runs in every Worker. Duplicate sweeps are harmless: a row
 	// is touched before being requeued, and the session lease admits only one
 	// Worker per conversation regardless of how many hints arrive.
+	// The redeliverer is the Worker itself: resending a reply needs the same
+	// channel registry and rate limiter as a first delivery, and nothing else.
 	go worker.NewSweeper(worker.SweepConfig{
-		Interval: cfg.Scheduler.SweepInterval,
-		Age:      cfg.Scheduler.SweepAge,
-		Batch:    cfg.Scheduler.SweepBatch,
-	}, db, sched, sched, logger).Run(ctx)
+		Interval:            cfg.Scheduler.SweepInterval,
+		Age:                 cfg.Scheduler.SweepAge,
+		Batch:               cfg.Scheduler.SweepBatch,
+		MaxDeliveryAttempts: cfg.Scheduler.MaxDeliveryAttempts,
+	}, db, sched, sched, logger).WithRedeliverer(w).Run(ctx)
 
 	logger.Info("worker ready", "worker_id", w.ID())
 	if err := w.Run(ctx); err != nil {

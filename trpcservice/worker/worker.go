@@ -56,7 +56,17 @@ type Deps struct {
 	Audit      types.AuditSink
 	Tracer     *telemetry.Provider
 	DeadLetter DeadLetterSink
+	RateLimit  RateLimiter
 	Logger     *slog.Logger
+}
+
+// RateLimiter caps outbound messages per binding.
+//
+// Triggering the limit queues rather than drops: the agent has already run,
+// so discarding the reply means the user gets nothing for work that was
+// already paid for.
+type RateLimiter interface {
+	AllowRate(ctx context.Context, scope string, limitPerMin int) (bool, error)
 }
 
 // DeadLetterSink bounds how often one message may be retried and holds the
@@ -94,6 +104,7 @@ type Worker struct {
 	audit      types.AuditSink
 	tracer     *telemetry.Provider
 	deadLetter DeadLetterSink
+	rateLimit  RateLimiter
 	log        *slog.Logger
 
 	// id identifies this process as a lease owner. Two Workers on one host
@@ -150,7 +161,8 @@ func New(d Deps) (*Worker, error) {
 		cfg: d.Config, store: d.Store, dispatcher: d.Dispatcher,
 		mailbox: d.Mailbox, lease: d.Lease, runtimes: d.Runtimes,
 		channels: d.Channels, metrics: rec, usage: d.Usage, audit: d.Audit,
-		tracer: d.Tracer, deadLetter: d.DeadLetter, log: logger, id: id,
+		tracer: d.Tracer, deadLetter: d.DeadLetter, rateLimit: d.RateLimit,
+		log: logger, id: id,
 		slots: make(chan struct{}, d.Config.Worker.Concurrency),
 	}, nil
 }
@@ -697,7 +709,14 @@ func (w *Worker) deliver(
 	// Long replies are split at the channel's limit rather than truncated.
 	// Splitting lives here, not in each channel, so every channel behaves the
 	// same way.
-	for _, part := range splitText(reply, binding.Capabilities.MaxTextLength) {
+	parts := splitText(reply, binding.Capabilities.MaxTextLength)
+	for _, part := range parts {
+		// Rate limit per binding, checked per part: splitting a long reply
+		// into five messages consumes five of the platform's allowance, and
+		// exceeding it gets the whole binding throttled.
+		if err := w.awaitRateLimit(ctx, log, binding); err != nil {
+			return err
+		}
 		if err := out.Send(ctx, deliveryTarget(sess, msg), types.NewTextReply(part), binding); err != nil {
 			return err
 		}
@@ -809,4 +828,85 @@ func (w *Worker) recordFailure(ctx context.Context, log *slog.Logger, sessionID 
 	w.metrics.DeadLettered(msg.TenantID, msg.Channel)
 	log.Error("message moved to dead letter after exhausting retries",
 		"attempts", attempts, "reason", reason)
+}
+
+// awaitRateLimit waits until the binding is under its per-minute allowance.
+//
+// It waits rather than failing. The agent has already run and its tools have
+// already had their effects, so dropping the reply would charge the tenant for
+// an answer the user never sees. The wait is bounded so a permanently
+// saturated binding surfaces as a delivery failure — which the sweeper then
+// retries — instead of pinning a Worker slot forever.
+func (w *Worker) awaitRateLimit(ctx context.Context, log *slog.Logger, binding *types.ChannelBinding) error {
+	limit := binding.Capabilities.RateLimitPerMin
+	if w.rateLimit == nil || limit <= 0 {
+		return nil
+	}
+
+	scope := "outbound:" + binding.ChannelBindingID
+	deadline := time.Now().Add(30 * time.Second)
+
+	for {
+		allowed, err := w.rateLimit.AllowRate(ctx, scope, limit)
+		if err != nil {
+			// A broken limiter must not block delivery. Proceeding risks the
+			// platform's own throttle, which is recoverable; withholding the
+			// reply is not.
+			log.Warn("rate limiter unavailable, delivering anyway",
+				"error", applog.Scrub(err.Error()))
+			return nil
+		}
+		if allowed {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("outbound rate limit for %s not cleared within 30s",
+				binding.ChannelBindingID)
+		}
+
+		log.Debug("outbound rate limited, waiting", "limit_per_min", limit)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// Redeliver sends an already-produced reply again, without re-running the
+// agent.
+//
+// This is the sweeper's entry point for a delivery that failed after a
+// successful run. It deliberately does not touch the Runtime, the mailbox or
+// the lease: nothing is re-executed, only re-sent.
+func (w *Worker) Redeliver(ctx context.Context, tenantID, sessionID, requestID, reply string) error {
+	sess, err := w.store.SessionByID(ctx, tenantID, sessionID)
+	if err != nil {
+		return fmt.Errorf("load session for redelivery: %w", err)
+	}
+
+	rc := &types.RequestContext{
+		TenantID:         sess.TenantID,
+		AgentAppID:       sess.AgentAppID,
+		AgentVersion:     sess.AgentVersion,
+		Channel:          sess.Channel,
+		ChannelBindingID: sess.ChannelBindingID,
+		SessionID:        sess.SessionID,
+		RequestID:        requestID,
+	}
+	ctx = types.NewContext(ctx, rc)
+	log := applog.With(w.log, rc).With("worker_id", w.id, "redelivery", true)
+
+	// The original inbound message is gone by now, so the delivery target is
+	// derived from the session alone. That works because a direct session's
+	// scope key *is* the external user id.
+	err = w.deliver(ctx, log, sess, &types.InboundMessage{
+		Channel:          sess.Channel,
+		ChannelBindingID: sess.ChannelBindingID,
+		TenantID:         sess.TenantID,
+		ExternalUserID:   sess.ScopeKey,
+		RequestID:        requestID,
+	}, reply)
+	w.metrics.Delivery(ctx, sess.Channel, err)
+	return err
 }

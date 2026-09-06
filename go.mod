@@ -77,5 +77,7 @@ require (
 	google.golang.org/grpc v1.76.0 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
 	trpc.group/trpc-go/trpc-a2a-go v0.2.6-0.20260721084546-18c8244d0acb // indirect
+	trpc.group/trpc-go/trpc-agent-go/session/mysql v1.11.2 // indirect
+	trpc.group/trpc-go/trpc-agent-go/storage/mysql v1.8.0 // indirect
 	trpc.group/trpc-go/trpc-agent-go/storage/redis v1.8.0 // indirect
 )

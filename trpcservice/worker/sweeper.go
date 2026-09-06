@@ -23,6 +23,10 @@ type SweepConfig struct {
 	// Batch bounds one pass, so a large backlog is worked through gradually
 	// rather than flooding the queue in a single tick.
 	Batch int
+	// MaxDeliveryAttempts bounds redelivery of one reply. Past the bound the
+	// request becomes terminal: an undeliverable reply should stop consuming
+	// the platform's outbound rate limit indefinitely.
+	MaxDeliveryAttempts int
 }
 
 // Sweeper requeues requests that never reached a terminal state.
@@ -42,11 +46,22 @@ type SweepConfig struct {
 // mailbox, dispatcher and database, and a third deployable to operate would be
 // a poor trade for one loop.
 type Sweeper struct {
-	cfg     SweepConfig
-	store   *store.Store
-	mailbox types.SessionMailbox
-	queue   types.SessionDispatcher
-	log     *slog.Logger
+	cfg       SweepConfig
+	store     *store.Store
+	mailbox   types.SessionMailbox
+	queue     types.SessionDispatcher
+	redeliver Redeliverer
+	log       *slog.Logger
+}
+
+// Redeliverer sends an already-produced reply again.
+//
+// Separate from the normal execution path on purpose. Once the agent has run,
+// a delivery failure must retry *only* the delivery: the tools already ran and
+// their side effects already happened, so re-executing would place a second
+// order or send a second notification.
+type Redeliverer interface {
+	Redeliver(ctx context.Context, tenantID, sessionID, requestID, reply string) error
 }
 
 // NewSweeper builds a Sweeper, filling defaults.
@@ -64,7 +79,18 @@ func NewSweeper(cfg SweepConfig, s *store.Store, mailbox types.SessionMailbox, q
 	if cfg.Batch <= 0 {
 		cfg.Batch = 50
 	}
+	if cfg.MaxDeliveryAttempts <= 0 {
+		cfg.MaxDeliveryAttempts = 5
+	}
 	return &Sweeper{cfg: cfg, store: s, mailbox: mailbox, queue: queue, log: logger}
+}
+
+// WithRedeliverer enables the failed-delivery pass. Without one the sweeper
+// only requeues stranded requests; the delivery_failed rows would accumulate
+// with nobody consuming them.
+func (s *Sweeper) WithRedeliverer(r Redeliverer) *Sweeper {
+	s.redeliver = r
+	return s
 }
 
 // Run sweeps until ctx is cancelled.
@@ -85,6 +111,9 @@ func (s *Sweeper) Run(ctx context.Context) {
 		case <-ticker.C:
 			if n := s.sweepOnce(ctx); n > 0 {
 				s.log.Info("stranded requests requeued", "count", n)
+			}
+			if n := s.retryDeliveries(ctx); n > 0 {
+				s.log.Info("replies redelivered", "count", n)
 			}
 		}
 	}
@@ -138,4 +167,71 @@ func (s *Sweeper) sweepOnce(ctx context.Context) int {
 		requeued++
 	}
 	return requeued
+}
+
+// retryDeliveries resends replies that were produced but never delivered.
+//
+// The distinction from sweepOnce is the whole point: a stranded request is
+// re-executed, a failed delivery is only re-sent. Collapsing the two would
+// repeat every tool call for a message whose only problem was a network
+// hiccup on the way out.
+func (s *Sweeper) retryDeliveries(ctx context.Context) int {
+	if s.redeliver == nil {
+		return 0
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	failed, err := s.store.FindFailedDeliveries(ctx, s.cfg.Age, s.cfg.MaxDeliveryAttempts, s.cfg.Batch)
+	if err != nil {
+		s.log.Error("finding failed deliveries failed", "error", applog.Scrub(err.Error()))
+		return 0
+	}
+
+	sent := 0
+	for _, si := range failed {
+		log := s.log.With(
+			"tenant_id", si.TenantID,
+			"session_id", si.SessionID,
+			"request_id", si.RequestID,
+			"trace_id", si.TraceID,
+			"attempts", si.Attempts)
+
+		// The reply is read back from the session rather than kept on the
+		// inbound row, so there is one copy of the answer.
+		reply, err := s.store.LastAgentReply(ctx, si.TenantID, si.SessionID, si.RequestID)
+		if err != nil {
+			// No stored reply means the agent never actually finished, so
+			// this row was mislabelled. Mark it failed rather than leaving it
+			// to be retried forever against a reply that does not exist.
+			log.Error("no stored reply to redeliver, marking failed",
+				"error", applog.Scrub(err.Error()))
+			if err := s.store.UpdateInboundState(ctx, si.ChannelBindingID, si.ExternalEventID,
+				types.StateFailed, "delivery_failed with no stored reply"); err != nil {
+				log.Error("marking failed failed", "error", applog.Scrub(err.Error()))
+			}
+			continue
+		}
+
+		if err := s.redeliver.Redeliver(ctx, si.TenantID, si.SessionID, si.RequestID, reply); err != nil {
+			// UpdateInboundState increments attempts, so repeated failures
+			// walk toward MaxDeliveryAttempts and the row eventually drops
+			// out of the query above.
+			log.Warn("redelivery failed", "error", applog.Scrub(err.Error()))
+			if err := s.store.UpdateInboundState(ctx, si.ChannelBindingID, si.ExternalEventID,
+				types.StateDeliveryFailed, applog.Scrub(err.Error())); err != nil {
+				log.Error("recording redelivery failure failed", "error", applog.Scrub(err.Error()))
+			}
+			continue
+		}
+
+		if err := s.store.UpdateInboundState(ctx, si.ChannelBindingID, si.ExternalEventID,
+			types.StateSucceeded, ""); err != nil {
+			log.Error("marking succeeded failed", "error", applog.Scrub(err.Error()))
+		}
+		log.Info("reply redelivered without re-running the agent")
+		sent++
+	}
+	return sent
 }
