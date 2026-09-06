@@ -459,7 +459,7 @@ func (w *Worker) processMessage(
 	// repeat every tool call.
 	deliverCtx, deliverSpan := w.tracer.StartSpan(ctx, "worker.deliver",
 		attribute.String("channel", sess.Channel))
-	deliverErr := w.deliver(deliverCtx, log, sess, msg, reply)
+	queued, deliverErr := w.deliver(deliverCtx, log, sess, msg, reply)
 	if deliverErr != nil {
 		telemetry.RecordError(deliverSpan, deliverErr)
 	}
@@ -471,6 +471,20 @@ func (w *Worker) processMessage(
 			log.Error("marking delivery_failed failed", "error", applog.Scrub(updErr.Error()))
 		}
 		return fmt.Errorf("deliver reply: %w", err)
+	}
+
+	// A queued reply is not a delivered one. For a stream binding the socket
+	// belongs to a Gateway replica, and only that replica learns whether the
+	// send worked; marking succeeded here would claim a delivery that has
+	// not happened, and a later socket failure would have no row left to
+	// retry. The holder writes the terminal state instead.
+	//
+	// Until then the row stays in processing — the same state a stranded
+	// request sits in, so the existing sweep recovers a reply whose holder
+	// died before sending it, with no extra machinery.
+	if queued {
+		log.Info("reply queued for stream delivery; holder records the outcome")
+		return nil
 	}
 
 	if err := w.store.UpdateInboundState(ctx, msg.ChannelBindingID, msg.ExternalEventID,
@@ -696,16 +710,21 @@ func estimateCost(model string, prompt, completion int) float64 {
 }
 
 // deliver sends the reply back through the originating channel.
+//
+// It reports whether the reply was queued rather than sent, which happens for
+// stream bindings: the socket belongs to a Gateway replica, so this process
+// can only hand the reply over. The caller needs to know because a queued
+// reply must not yet be marked succeeded.
 func (w *Worker) deliver(
 	ctx context.Context,
 	log *slog.Logger,
 	sess *types.Session,
 	msg *types.InboundMessage,
 	reply string,
-) error {
+) (queued bool, err error) {
 	binding, err := w.store.ChannelBindingByID(ctx, sess.TenantID, sess.ChannelBindingID)
 	if err != nil {
-		return fmt.Errorf("load binding %s: %w", sess.ChannelBindingID, err)
+		return false, fmt.Errorf("load binding %s: %w", sess.ChannelBindingID, err)
 	}
 
 	// Long replies are split at the channel's limit rather than truncated.
@@ -720,12 +739,15 @@ func (w *Worker) deliver(
 	// The branch is on capabilities rather than on the channel name, so a
 	// second long-connection platform needs no change here.
 	if binding.Capabilities.StreamCapable() {
-		return w.deliverToOutbox(ctx, log, sess, msg, binding, parts)
+		if err := w.deliverToOutbox(ctx, log, sess, msg, binding, parts); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 
 	out, err := w.channels.Outbound(sess.Channel)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	for _, part := range parts {
@@ -733,14 +755,14 @@ func (w *Worker) deliver(
 		// into five messages consumes five of the platform's allowance, and
 		// exceeding it gets the whole binding throttled.
 		if err := w.awaitRateLimit(ctx, log, binding); err != nil {
-			return err
+			return false, err
 		}
 		if err := out.Send(ctx, deliveryTarget(sess, msg), types.NewTextReply(part), binding); err != nil {
-			return err
+			return false, err
 		}
 	}
 	log.Info("reply delivered", "channel", sess.Channel)
-	return nil
+	return false, nil
 }
 
 // deliverToOutbox queues a reply for the process holding the connection.
@@ -955,10 +977,30 @@ func (w *Worker) awaitRateLimit(ctx context.Context, log *slog.Logger, binding *
 // This is the sweeper's entry point for a delivery that failed after a
 // successful run. It deliberately does not touch the Runtime, the mailbox or
 // the lease: nothing is re-executed, only re-sent.
-func (w *Worker) Redeliver(ctx context.Context, tenantID, sessionID, requestID, reply string) error {
+// Redeliver sends an already-produced reply again, without re-running the
+// agent.
+//
+// This is the sweeper's entry point for a delivery that failed after a
+// successful run.
+//
+// original is the inbound message as first received, read back from the
+// inbound_events payload. It is required rather than reconstructed because
+// two of its fields cannot be derived from the session:
+//
+//   - ExternalEventID keys the delivery state machine. A stream reply queued
+//     without it leaves the holder unable to record the outcome, so a failed
+//     send would be indistinguishable from a successful one.
+//   - CorrelationID is the platform's token for the original exchange.
+//     Without it a long-connection reply degrades to an unsolicited push,
+//     which is a different message with different preconditions.
+func (w *Worker) Redeliver(
+	ctx context.Context,
+	tenantID, sessionID, requestID, reply string,
+	original *types.InboundMessage,
+) (queued bool, err error) {
 	sess, err := w.store.SessionByID(ctx, tenantID, sessionID)
 	if err != nil {
-		return fmt.Errorf("load session for redelivery: %w", err)
+		return false, fmt.Errorf("load session for redelivery: %w", err)
 	}
 
 	rc := &types.RequestContext{
@@ -973,16 +1015,26 @@ func (w *Worker) Redeliver(ctx context.Context, tenantID, sessionID, requestID, 
 	ctx = types.NewContext(ctx, rc)
 	log := applog.With(w.log, rc).With("worker_id", w.id, "redelivery", true)
 
-	// The original inbound message is gone by now, so the delivery target is
-	// derived from the session alone. That works because a direct session's
-	// scope key *is* the external user id.
-	err = w.deliver(ctx, log, sess, &types.InboundMessage{
+	// Rebuilt from the session for the fields that are stable, and from the
+	// stored payload for the ones that are not derivable. A direct session's
+	// scope key is the external user id, which is why the target survives
+	// even when the payload is missing.
+	msg := &types.InboundMessage{
 		Channel:          sess.Channel,
 		ChannelBindingID: sess.ChannelBindingID,
 		TenantID:         sess.TenantID,
 		ExternalUserID:   sess.ScopeKey,
 		RequestID:        requestID,
-	}, reply)
+	}
+	if original != nil {
+		msg.ExternalEventID = original.ExternalEventID
+		msg.CorrelationID = original.CorrelationID
+		if original.ExternalUserID != "" {
+			msg.ExternalUserID = original.ExternalUserID
+		}
+	}
+
+	queued, err = w.deliver(ctx, log, sess, msg, reply)
 	w.metrics.Delivery(ctx, sess.Channel, err)
-	return err
+	return queued, err
 }

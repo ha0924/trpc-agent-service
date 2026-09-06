@@ -60,8 +60,17 @@ type Sweeper struct {
 // a delivery failure must retry *only* the delivery: the tools already ran and
 // their side effects already happened, so re-executing would place a second
 // order or send a second notification.
+//
+// The original inbound message is passed through because the delivery state
+// machine is keyed by its ExternalEventID, and long-connection channels need
+// its CorrelationID to answer the original exchange rather than push a new
+// message.
+//
+// A true queued return means the reply was handed to another process for
+// sending, so the caller must not record a terminal state.
 type Redeliverer interface {
-	Redeliver(ctx context.Context, tenantID, sessionID, requestID, reply string) error
+	Redeliver(ctx context.Context, tenantID, sessionID, requestID, reply string,
+		original *types.InboundMessage) (queued bool, err error)
 }
 
 // NewSweeper builds a Sweeper, filling defaults.
@@ -214,7 +223,9 @@ func (s *Sweeper) retryDeliveries(ctx context.Context) int {
 			continue
 		}
 
-		if err := s.redeliver.Redeliver(ctx, si.TenantID, si.SessionID, si.RequestID, reply); err != nil {
+		queued, err := s.redeliver.Redeliver(ctx, si.TenantID, si.SessionID, si.RequestID,
+			reply, si.Payload)
+		if err != nil {
 			// UpdateInboundState increments attempts, so repeated failures
 			// walk toward MaxDeliveryAttempts and the row eventually drops
 			// out of the query above.
@@ -223,6 +234,22 @@ func (s *Sweeper) retryDeliveries(ctx context.Context) int {
 				types.StateDeliveryFailed, applog.Scrub(err.Error())); err != nil {
 				log.Error("recording redelivery failure failed", "error", applog.Scrub(err.Error()))
 			}
+			continue
+		}
+
+		// A queued reply is not a delivered one: for a stream binding the
+		// send happens in whichever Gateway replica holds the connection,
+		// and only that replica learns the outcome. Marking succeeded here
+		// would report a delivery that may still fail at the socket, with no
+		// row left to retry.
+		//
+		// The row stays in delivery_failed and the holder writes the
+		// terminal state. attempts was already incremented, so this cannot
+		// loop forever — it walks toward MaxDeliveryAttempts like any other
+		// stuck row.
+		if queued {
+			log.Info("reply queued for stream redelivery; holder will record the outcome")
+			sent++
 			continue
 		}
 
