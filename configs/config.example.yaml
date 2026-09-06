@@ -89,6 +89,9 @@ storage:
   # 未匹配到具体规则时的默认后端
   defaults:
     session: redis-main
+    # 长期记忆走 Redis：跨节点可见是硬要求，任意 Worker 都要能读到同一份
+    # 记忆，因此不能用 inmemory（那只在单进程内可见）。
+    memory: redis-main
   # 按租户与数据类型覆盖默认值。规则越具体优先级越高：
   # 租户+Agent+数据类型 > 租户+数据类型 > 默认值。
   #
@@ -98,6 +101,11 @@ storage:
   rules:
     - tenant_id: tenant-acme
       data_type: session
+      backend: mysql-main
+    # 同一个租户的记忆也落 MySQL。两条规则合起来证明路由是按
+    # 「租户 × 数据类型」二维生效的，而不是只按租户或只按类型。
+    - tenant_id: tenant-acme
+      data_type: memory
       backend: mysql-main
 
 # 模型凭据。

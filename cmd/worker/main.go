@@ -112,6 +112,17 @@ func run() error {
 	// measurement.
 	router.WithMetrics(recorder)
 
+	// Long-term memory routes through the same rules as sessions, so an
+	// operator expresses "tenant-acme goes to MySQL" once rather than once per
+	// data type. Nil when no memory backend is configured — an agent runs fine
+	// without recall, so its absence must not stop the Worker from starting.
+	memoryRouter, err := storage.NewMemoryRouter(startupCtx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer memoryRouter.Close()
+	memoryRouter.WithMetrics(recorder)
+
 	tools := platformtool.NewRegistry()
 	extensions := platformagent.NewExtensionRegistry()
 	logger.Info("capabilities registered",
@@ -126,7 +137,7 @@ func run() error {
 	// The store is the spec loader: assembly reads a version's prompt, model
 	// and bindings straight from the control plane, so no agent is defined in
 	// code.
-	runtimes, err := platformagent.NewProvider(platformagent.Deps{
+	deps := platformagent.Deps{
 		Config:     cfg,
 		Specs:      specLoader{db},
 		Router:     router,
@@ -143,7 +154,16 @@ func run() error {
 			Metrics:   recorder,
 		},
 		Logger: logger,
-	})
+	}
+	// Assigned only when non-nil. A typed nil pointer placed in an interface
+	// field makes that field non-nil, so the assembler would pass a nil
+	// router to the framework and every memory call would panic. This is the
+	// classic Go nil-interface trap and the reason for the explicit check.
+	if memoryRouter != nil {
+		deps.Memory = memoryRouter
+	}
+
+	runtimes, err := platformagent.NewProvider(deps)
 	if err != nil {
 		return err
 	}

@@ -32,6 +32,7 @@ import (
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
@@ -47,6 +48,7 @@ type Provider struct {
 	cfg        *config.Config
 	specs      types.SpecLoader
 	router     types.StorageRouter
+	memory     MemoryService
 	tools      *platformtool.Registry
 	extensions *ExtensionRegistry
 	policies   PolicyDeps
@@ -78,6 +80,11 @@ type Deps struct {
 	Router     types.StorageRouter
 	Tools      *platformtool.Registry
 	Extensions *ExtensionRegistry
+	// Memory routes long-term recall to a per-tenant backend. Nil disables
+	// memory rather than failing assembly: an agent runs fine without
+	// long-term recall, and a deployment that has not configured a memory
+	// backend must still start.
+	Memory MemoryService
 	// Policies are the platform services governance extensions depend on.
 	// Left zero, policies needing them refuse to mount rather than silently
 	// becoming no-ops that look like protection.
@@ -110,13 +117,23 @@ func NewProvider(d Deps) (*Provider, error) {
 	}
 
 	return &Provider{
-		cfg: d.Config, specs: d.Specs, router: d.Router,
+		cfg: d.Config, specs: d.Specs, router: d.Router, memory: d.Memory,
 		tools: tools, extensions: exts, policies: d.Policies, log: logger,
 		cache:    make(map[types.RuntimeKey]*list.Element),
 		lru:      list.New(),
 		building: make(map[types.RuntimeKey]chan struct{}),
 	}, nil
 }
+
+// MemoryService is the subset of the framework's memory.Service the assembler
+// needs.
+//
+// Declared as an interface here, rather than importing the framework's type
+// into this package's Deps, so that a test can inject a fake and so the agent
+// package does not depend on the storage package. It is deliberately the full
+// framework interface: narrowing it would mean the router could not be passed
+// straight to runner.WithMemoryService.
+type MemoryService = memory.Service
 
 // Get returns the Runtime for key, assembling it on first use.
 //
@@ -331,10 +348,19 @@ func (p *Provider) assemble(ctx context.Context, key types.RuntimeKey) (*types.R
 	// The storage router is the session service. Injecting it here is what
 	// puts per-tenant backend selection on the framework's own execution path
 	// instead of beside it.
+	//
+	// The memory router goes in the same way and for the same reason. Until it
+	// did, the platform's multi-backend routing was true of exactly one data
+	// type: sessions flowed through the router while the Memory, Summary,
+	// Knowledge and Artifact DataType constants had zero use sites.
+	runOpts := []runner.Option{runner.WithSessionService(p.router)}
+	if p.memory != nil {
+		runOpts = append(runOpts, runner.WithMemoryService(p.memory))
+	}
 	run := runner.NewRunner(
 		types.AppName(key.TenantID, key.AgentAppID),
 		built,
-		runner.WithSessionService(p.router),
+		runOpts...,
 	)
 
 	p.log.Info("runtime assembled",
