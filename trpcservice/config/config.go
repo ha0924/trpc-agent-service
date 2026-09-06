@@ -38,6 +38,11 @@ type Config struct {
 
 // GatewayConfig configures the inbound HTTP process.
 type GatewayConfig struct {
+	// ID identifies this replica as a connection-lease owner, for stream-mode
+	// bindings. Empty means derive it from hostname and pid, which is what
+	// keeps two replicas on one machine from releasing each other's leases
+	// and both connecting — the platform allows a bot only one connection.
+	ID              string        `yaml:"id"`
 	Addr            string        `yaml:"addr"`
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 }

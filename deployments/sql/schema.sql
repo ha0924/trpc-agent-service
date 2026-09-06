@@ -156,15 +156,19 @@ CREATE TABLE IF NOT EXISTS agent_skill_bindings (
 
 -- webhook_path 唯一，Gateway 据请求路径反查绑定，从而确定租户与 Agent。
 -- 入站报文是不可信输入，租户身份只能来自绑定，不能来自报文自称。
+--
+-- webhook_path 可为 NULL：长连接模式（capabilities.inbound_mode = 'stream'）
+-- 没有回调地址，消息经平台服务主动建立的 WebSocket 推送。MySQL 的唯一键允许
+-- 多行 NULL，因此多条长连接绑定可以并存而不冲突。
 CREATE TABLE IF NOT EXISTS channel_bindings (
   id                 BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   channel_binding_id VARCHAR(64)  NOT NULL,
   tenant_id          VARCHAR(64)  NOT NULL,
   agent_app_id       VARCHAR(64)  NOT NULL,
   env                VARCHAR(32)  NOT NULL DEFAULT 'prod',
-  channel            VARCHAR(32)  NOT NULL COMMENT 'mock / wecom / wechat_kf / telegram',
+  channel            VARCHAR(32)  NOT NULL COMMENT 'mock / wecom / wecom_aibot / wechat_kf / telegram',
   external_app_id    VARCHAR(128) NULL COMMENT '通道侧应用标识',
-  webhook_path       VARCHAR(255) NULL,
+  webhook_path       VARCHAR(255) NULL COMMENT '回调路径；长连接模式为 NULL',
   secret_ref         VARCHAR(255) NULL COMMENT '密钥引用，不存明文',
   capabilities       JSON         NULL COMMENT '能力描述符，结构见数据模型设计 §6',
   status             VARCHAR(32)  NOT NULL DEFAULT 'active',

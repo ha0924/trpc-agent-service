@@ -48,6 +48,12 @@ const (
 	// InboundModeFetch means the callback only signals that messages are
 	// waiting and they must be pulled with a cursor.
 	InboundModeFetch InboundMode = "fetch"
+	// InboundModeStream means there is no callback at all: the platform
+	// connects out to the IM provider and the provider pushes over that
+	// connection. The direction is reversed, so bindings in this mode have no
+	// webhook path and their replies must leave through the process holding
+	// the connection. See types.StreamChannel.
+	InboundModeStream InboundMode = "stream"
 )
 
 // AckInfo is what a channel may echo back in its immediate response.

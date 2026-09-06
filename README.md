@@ -157,6 +157,8 @@ mysql -u root -p < deployments/sql/schema_governance.sql
 mysql -u root -p < deployments/sql/seed.sql
 mysql -u root -p < deployments/sql/seed_governance.sql
 mysql -u root -p < deployments/sql/seed_wecom.sql
+# 企业微信智能机器人（长连接）绑定。与上一条并存，二者接入方向相反
+mysql -u root -p < deployments/sql/seed_wecom_aibot.sql
 mysql -u root -p < deployments/sql/seed_tenant2.sql
 
 # 可选：死信链路的演示素材（一个必然装配失败的 Agent）。生产勿导入。
@@ -276,7 +278,7 @@ docker compose -f deployments/docker-compose.yml up --build
 | 配置驱动的 Runtime 装配与缓存 | ✅ |
 | 多租户隔离（同名同版本对抗性验证） | ✅ |
 | Storage Router，实现框架 `session.Service` | ✅ Redis / MySQL / InMemory 三后端，按租户路由 |
-| IM 通道 | ✅ Mock、企业微信 |
+| IM 通道 | ✅ Mock、企业微信（URL 回调）、企业微信智能机器人（长连接） |
 | 治理五策略 | ✅ 工具白名单、脱敏、预算、危险工具确认、用户权限 |
 | 审计日志（11 字段）与 Usage 记录 | ✅ |
 | 指标与 `/metrics` | ✅ 8 类，均带租户标签 |
@@ -290,5 +292,5 @@ docker compose -f deployments/docker-compose.yml up --build
 占位模型在输出里明确声明自己未接入，避免被误认成真实回答。
 
 **逐项完成度、未完成项及其原因见 [`docs/完成度台账.md`](docs/完成度台账.md)。**
-上表只标「有没有」，台账标「到什么程度」——包括企业微信长连接模式未实现、
+上表只标「有没有」，台账标「到什么程度」——包括企业微信长连接尚未对真实 bot 联调、
 Memory 与 Summary 只有接口位没有实现等已知缺口。

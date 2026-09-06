@@ -169,7 +169,12 @@ func run() error {
 		Audit:      audit,
 		DeadLetter: sched,
 		RateLimit:  sched,
-		Logger:     logger,
+		// Replies for stream-mode bindings cannot leave from here: the socket
+		// belongs to a Gateway replica. They go to the outbox, which that
+		// replica drains — a queue rather than a call, so the two processes
+		// still never invoke each other.
+		Outbox: sched,
+		Logger: logger,
 	})
 	if err != nil {
 		return err

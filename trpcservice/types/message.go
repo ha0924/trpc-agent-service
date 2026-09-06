@@ -60,6 +60,17 @@ type InboundMessage struct {
 	Text  string                `json:"text,omitempty"`
 	Parts []gwproto.ContentPart `json:"parts,omitempty"`
 
+	// CorrelationID is the platform's own token for this message, when the
+	// platform requires the reply to echo it. Long-connection channels do:
+	// WeCom's aibot protocol keys a reply to the req_id of the callback it
+	// answers.
+	//
+	// It rides on the message so it survives the trip through the queue to
+	// the Worker and back out on the reply — the platform layer never reads
+	// or rewrites it. Empty for channels that reply over a fresh HTTP request
+	// and need no correlation.
+	CorrelationID string `json:"correlation_id,omitempty"`
+
 	// Tracing.
 	RequestID  string    `json:"request_id"`
 	TraceID    string    `json:"trace_id"`

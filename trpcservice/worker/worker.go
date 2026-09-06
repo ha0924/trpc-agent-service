@@ -57,7 +57,12 @@ type Deps struct {
 	Tracer     *telemetry.Provider
 	DeadLetter DeadLetterSink
 	RateLimit  RateLimiter
-	Logger     *slog.Logger
+	// Outbox carries replies for stream-mode bindings back to the Gateway
+	// replica holding the connection. Optional: a deployment with no
+	// long-connection bindings needs none, and a stream binding without one
+	// fails loudly at delivery rather than quietly dropping replies.
+	Outbox types.StreamOutbox
+	Logger *slog.Logger
 }
 
 // RateLimiter caps outbound messages per binding.
@@ -105,6 +110,7 @@ type Worker struct {
 	tracer     *telemetry.Provider
 	deadLetter DeadLetterSink
 	rateLimit  RateLimiter
+	outbox     types.StreamOutbox
 	log        *slog.Logger
 
 	// id identifies this process as a lease owner. Two Workers on one host
@@ -162,7 +168,8 @@ func New(d Deps) (*Worker, error) {
 		mailbox: d.Mailbox, lease: d.Lease, runtimes: d.Runtimes,
 		channels: d.Channels, metrics: rec, usage: d.Usage, audit: d.Audit,
 		tracer: d.Tracer, deadLetter: d.DeadLetter, rateLimit: d.RateLimit,
-		log: logger, id: id,
+		outbox: d.Outbox,
+		log:    logger, id: id,
 		slots: make(chan struct{}, d.Config.Worker.Concurrency),
 	}, nil
 }
@@ -696,11 +703,6 @@ func (w *Worker) deliver(
 	msg *types.InboundMessage,
 	reply string,
 ) error {
-	out, err := w.channels.Outbound(sess.Channel)
-	if err != nil {
-		return err
-	}
-
 	binding, err := w.store.ChannelBindingByID(ctx, sess.TenantID, sess.ChannelBindingID)
 	if err != nil {
 		return fmt.Errorf("load binding %s: %w", sess.ChannelBindingID, err)
@@ -710,6 +712,22 @@ func (w *Worker) deliver(
 	// Splitting lives here, not in each channel, so every channel behaves the
 	// same way.
 	parts := splitText(reply, binding.Capabilities.MaxTextLength)
+
+	// A stream binding's reply can only leave through the socket it arrived
+	// on, which this process does not hold. It goes to the outbox instead,
+	// and the Gateway replica holding the connection sends it.
+	//
+	// The branch is on capabilities rather than on the channel name, so a
+	// second long-connection platform needs no change here.
+	if binding.Capabilities.StreamCapable() {
+		return w.deliverToOutbox(ctx, log, sess, msg, binding, parts)
+	}
+
+	out, err := w.channels.Outbound(sess.Channel)
+	if err != nil {
+		return err
+	}
+
 	for _, part := range parts {
 		// Rate limit per binding, checked per part: splitting a long reply
 		// into five messages consumes five of the platform's allowance, and
@@ -722,6 +740,64 @@ func (w *Worker) deliver(
 		}
 	}
 	log.Info("reply delivered", "channel", sess.Channel)
+	return nil
+}
+
+// deliverToOutbox queues a reply for the process holding the connection.
+//
+// Rate limiting stays on this side even though the send happens elsewhere:
+// the limit is the platform's per-conversation allowance, and the Worker is
+// where a reply's parts are known. Doing it here also keeps back-pressure
+// where the work is, rather than letting the outbox absorb an unbounded
+// burst.
+//
+// Returning an error leaves the message in delivery_failed for the sweeper,
+// exactly as a failed HTTP send would — the reverse path deliberately reuses
+// the forward path's failure handling rather than inventing its own.
+func (w *Worker) deliverToOutbox(
+	ctx context.Context,
+	log *slog.Logger,
+	sess *types.Session,
+	msg *types.InboundMessage,
+	binding *types.ChannelBinding,
+	parts []string,
+) error {
+	if w.outbox == nil {
+		// Configuration gap rather than a runtime fault: a stream binding
+		// exists but the Worker was built without an outbox, so no reply
+		// could ever reach the user. Say so plainly.
+		return fmt.Errorf("stream binding %s requires an outbox, none configured",
+			binding.ChannelBindingID)
+	}
+
+	for _, part := range parts {
+		if err := w.awaitRateLimit(ctx, log, binding); err != nil {
+			return err
+		}
+		reply := &types.StreamReply{
+			Channel:          sess.Channel,
+			ChannelBindingID: sess.ChannelBindingID,
+			TenantID:         sess.TenantID,
+			Target:           deliveryTarget(sess, msg),
+			Scope:            sess.Scope,
+			CorrelationID:    msg.CorrelationID,
+			ExternalEventID:  msg.ExternalEventID,
+			Text:             part,
+			SessionID:        sess.SessionID,
+			RequestID:        msg.RequestID,
+			TraceID:          msg.TraceID,
+			// The W3C context, so the holder's send span joins this trace
+			// instead of starting a second tree — the same reason the forward
+			// hint carries it.
+			TraceContext: telemetry.Inject(ctx),
+		}
+		if err := w.outbox.PushReply(ctx, reply); err != nil {
+			return fmt.Errorf("queue stream reply: %w", err)
+		}
+	}
+
+	log.Info("reply queued for stream delivery",
+		"channel", sess.Channel, "parts", len(parts))
 	return nil
 }
 

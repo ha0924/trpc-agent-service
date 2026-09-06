@@ -77,6 +77,53 @@ SELECT channel_binding_id, tenant_id, agent_app_id, env, channel,
 	return &b, nil
 }
 
+// StreamBindings lists every active binding whose capabilities put it in
+// stream mode, across all tenants.
+//
+// Cross-tenant on purpose, and one of very few queries that is: Gateway needs
+// to know which connections to open before any request has arrived, so there
+// is no request context to scope by. Each returned binding still carries its
+// own tenant id, and everything downstream — the sink, the session, the
+// runtime key — is scoped by that.
+//
+// Filtering happens in Go rather than SQL because capabilities is a JSON
+// column and the binding count is small; a JSON path predicate would tie this
+// query to MySQL's JSON functions for no measurable gain.
+func (s *Store) StreamBindings(ctx context.Context) ([]types.ChannelBinding, error) {
+	const q = `
+SELECT channel_binding_id, tenant_id, agent_app_id, env, channel,
+       COALESCE(external_app_id, ''), COALESCE(webhook_path, ''),
+       COALESCE(secret_ref, ''), capabilities, status
+  FROM channel_bindings
+ WHERE status = 'active'
+ ORDER BY channel_binding_id`
+
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("query stream bindings: %w", err)
+	}
+	defer rows.Close()
+
+	var out []types.ChannelBinding
+	for rows.Next() {
+		var (
+			b   types.ChannelBinding
+			raw []byte
+		)
+		if err := rows.Scan(&b.ChannelBindingID, &b.TenantID, &b.AgentAppID, &b.Env,
+			&b.Channel, &b.ExternalAppID, &b.WebhookPath, &b.SecretRef, &raw, &b.Status); err != nil {
+			return nil, fmt.Errorf("scan binding: %w", err)
+		}
+		if err := decodeJSON(raw, &b.Capabilities); err != nil {
+			return nil, fmt.Errorf("decode capabilities for %s: %w", b.ChannelBindingID, err)
+		}
+		if b.Capabilities.StreamCapable() {
+			out = append(out, b)
+		}
+	}
+	return out, rows.Err()
+}
+
 // TenantByID loads a tenant.
 func (s *Store) TenantByID(ctx context.Context, tenantID string) (*types.Tenant, error) {
 	const q = `SELECT tenant_id, name, status, settings FROM tenants WHERE tenant_id = ?`

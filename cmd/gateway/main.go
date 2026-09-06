@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecom"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecomaibot"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
 	applog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
@@ -29,7 +31,23 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/scheduler"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/store"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/types"
 )
+
+// streamOwnerID identifies this replica in connection leases.
+//
+// Two replicas on one host must differ, or each could release the other's
+// lease and both would connect — the exact contention the lease prevents.
+func streamOwnerID(cfg *config.Config) string {
+	if id := strings.TrimSpace(cfg.Gateway.ID); id != "" {
+		return id
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		host = "unknown"
+	}
+	return fmt.Sprintf("gateway-%s-%d", host, os.Getpid())
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -99,6 +117,13 @@ func run() error {
 	registry.RegisterInbound(wecom.Name, wecom.New(cfg.ResolveSecret, nil, logger))
 	logger.Info("channels registered", "channels", registry.Names())
 
+	// Stream channels are kept in their own map rather than the registry:
+	// they implement a different inbound contract (no HTTP request to verify,
+	// no response to write), and only the supervisor consumes them.
+	streamChannels := map[string]types.StreamChannel{
+		wecomaibot.Name: wecomaibot.New(cfg.ResolveSecret, logger),
+	}
+
 	gw, err := gateway.New(gateway.Deps{
 		Config:     cfg,
 		Store:      db,
@@ -113,6 +138,33 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	// The supervisor is what makes openclaw's Run(ctx) a live call site: it
+	// elects one replica per stream binding and holds that binding's
+	// connection. Bindings in callback mode are unaffected and still handled
+	// by any replica.
+	supervisor, err := gateway.NewStreamSupervisor(gw, gateway.StreamDeps{
+		Channels: streamChannels,
+		Outbox:   sched,
+		Leases:   sched,
+		Owner:    streamOwnerID(cfg),
+		Logger:   logger,
+	})
+	if err != nil {
+		return err
+	}
+	// So /healthz can report which bindings this replica holds and whether
+	// any outbox is backing up — the only signal that reveals a dead holder.
+	gw.AttachStreamSupervisor(supervisor)
+
+	go func() {
+		if err := supervisor.Run(ctx); err != nil {
+			// A failure here costs the long-connection bindings, not the
+			// HTTP listener, so it is logged rather than fatal.
+			logger.Error("stream supervisor stopped",
+				"error", applog.Scrub(err.Error()))
+		}
+	}()
 
 	srv := &http.Server{
 		Addr:              cfg.Gateway.Addr,

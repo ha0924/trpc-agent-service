@@ -61,6 +61,10 @@ type Gateway struct {
 	tracer     *telemetry.Provider
 	deadLetter admin.DeadLetterStore
 	log        *slog.Logger
+
+	// streams is set after construction, purely so /healthz can report
+	// long-connection state. Nil when no stream bindings are configured.
+	streams *StreamSupervisor
 }
 
 // New builds a Gateway.
@@ -129,8 +133,26 @@ func (g *Gateway) handleHealth(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "degraded", "mysql": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+
+	body := gin.H{"status": "ok"}
+
+	// Stream bindings are reported because their failure mode is silence: if
+	// the replica holding a bot's connection dies, nothing else here turns
+	// red and replies simply accumulate. See 风险清单.md #13.
+	if g.streams != nil {
+		body["stream_bindings"] = g.streams.Health(ctx)
+	}
+
+	c.JSON(http.StatusOK, body)
 }
+
+// AttachStreamSupervisor lets the health endpoint report long-connection
+// state.
+//
+// Set after construction because the supervisor needs the Gateway to build:
+// the dependency is genuinely circular, and an explicit setter is clearer
+// than splitting one of them into two phases.
+func (g *Gateway) AttachStreamSupervisor(s *StreamSupervisor) { g.streams = s }
 
 // handleWebhook is the single entry point for every channel.
 func (g *Gateway) handleWebhook(c *gin.Context) {
@@ -259,6 +281,98 @@ func (g *Gateway) handleWebhook(c *gin.Context) {
 type acceptedMessage struct {
 	msg  *types.InboundMessage
 	hint types.SessionHint
+}
+
+// Accept runs one message through the inbound pipeline without an HTTP
+// request in sight: idempotency record, mailbox, queue.
+//
+// This is the entry point stream channels use. It exists so that a
+// long-connection channel joins the *same* pipeline as a webhook callback
+// rather than opening a parallel one — the ordering and deduplication
+// guarantees must have exactly one implementation. handleWebhook keeps its
+// own loop only because it batches several messages behind a single ACK.
+//
+// The binding is a parameter rather than something looked up from the
+// message, and that is the point: the caller obtained it from the control
+// plane before opening the connection, so the tenant is never taken from
+// anything a channel handed us. The fields a channel does fill in —
+// TenantID, AgentAppID — are overwritten here from the binding for the same
+// reason.
+func (g *Gateway) Accept(
+	ctx context.Context,
+	binding *types.ChannelBinding,
+	msg *types.InboundMessage,
+) (types.AckInfo, error) {
+	if binding == nil {
+		return types.AckInfo{}, errors.New("gateway: accept requires a channel binding")
+	}
+	if msg == nil {
+		return types.AckInfo{}, errors.New("gateway: nil inbound message")
+	}
+
+	ctx, span := g.tracer.StartSpan(ctx, "gateway.accept",
+		attribute.String("channel", binding.Channel),
+		attribute.String("channel.binding_id", binding.ChannelBindingID),
+		attribute.String("tenant.id", binding.TenantID),
+		attribute.String("agent.app_id", binding.AgentAppID))
+	defer span.End()
+
+	// The binding is authoritative for tenancy and routing.
+	msg.Channel = binding.Channel
+	msg.ChannelBindingID = binding.ChannelBindingID
+	msg.TenantID = binding.TenantID
+	msg.AgentAppID = binding.AgentAppID
+
+	if msg.TraceID == "" {
+		if traceID := telemetry.TraceIDFrom(ctx); traceID != "" {
+			msg.TraceID = traceID
+		} else {
+			msg.TraceID = "trace-" + uuid.NewString()
+		}
+	}
+	if msg.RequestID == "" {
+		msg.RequestID = "req-" + uuid.NewString()
+	}
+
+	log := g.log.With("tenant_id", binding.TenantID, "agent_app_id", binding.AgentAppID,
+		"channel", binding.Channel, "channel_binding_id", binding.ChannelBindingID,
+		"trace_id", msg.TraceID)
+
+	info, item, err := g.admit(ctx, log, binding, msg)
+	if err != nil {
+		// Same fail-closed reasoning as the callback path: with the
+		// idempotency record uncommitted we cannot tell a new message from a
+		// repeat. A stream channel has no platform-side redelivery to fall
+		// back on, so the error must reach the caller rather than be
+		// swallowed.
+		telemetry.RecordError(span, err)
+		return types.AckInfo{}, err
+	}
+	if item == nil {
+		return info, nil // duplicate: recorded already, nothing to queue
+	}
+
+	g.enqueue(context.WithoutCancel(ctx), log, []acceptedMessage{*item})
+	return info, nil
+}
+
+// SinkFor returns a MessageSink bound to one binding, for a stream channel to
+// hand messages to.
+//
+// Binding it here rather than letting the channel name its own binding per
+// message is what keeps the tenant trustworthy: the sink can only ever admit
+// messages for the binding the supervisor opened it with.
+func (g *Gateway) SinkFor(binding *types.ChannelBinding) types.MessageSink {
+	return &bindingSink{gw: g, binding: binding}
+}
+
+type bindingSink struct {
+	gw      *Gateway
+	binding *types.ChannelBinding
+}
+
+func (s *bindingSink) Accept(ctx context.Context, msg *types.InboundMessage) (types.AckInfo, error) {
+	return s.gw.Accept(ctx, s.binding, msg)
 }
 
 // admit locates the session and writes the idempotency record.
