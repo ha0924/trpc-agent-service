@@ -5,6 +5,8 @@ package types
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"time"
 )
 
@@ -138,6 +140,15 @@ type ToolApproval struct {
 	State       ApprovalState  `json:"state"`
 	Reason      string         `json:"reason,omitempty"`
 	ExpiresAt   *time.Time     `json:"expires_at,omitempty"`
+
+	// ArgsFingerprint binds the approval to the exact arguments that were
+	// shown to whoever approved it.
+	//
+	// Without it, approving "delete order 123" would also authorise "delete
+	// order 999": the guardrail would find an approved row for the tool and
+	// let the next call through whatever its arguments. The fingerprint makes
+	// the approval specific to what was actually reviewed.
+	ArgsFingerprint string `json:"args_fingerprint,omitempty"`
 }
 
 // ApprovalState is the lifecycle of a confirmation request.
@@ -151,7 +162,42 @@ const (
 	// from rejected so an unanswered request is not mistaken for a refusal
 	// when reviewing what happened.
 	ApprovalExpired ApprovalState = "expired"
+	// ApprovalConsumed means an approved request has been spent on the call
+	// it authorised.
+	//
+	// Without this state an approval would authorise the same tool forever:
+	// the guardrail would keep finding an approved row and keep letting calls
+	// through. One approval must buy exactly one execution — otherwise
+	// confirming once permanently disables the gate, which is worse than
+	// having no gate because it looks like one.
+	ApprovalConsumed ApprovalState = "consumed"
 )
+
+// Decided reports whether the request has been answered.
+func (s ApprovalState) Decided() bool {
+	return s == ApprovalApproved || s == ApprovalRejected
+}
+
+// Terminal reports whether no further transition is possible.
+func (s ApprovalState) Terminal() bool {
+	return s == ApprovalRejected || s == ApprovalExpired || s == ApprovalConsumed
+}
+
+// FingerprintArgs derives the fingerprint stored on an approval.
+//
+// Hashed rather than compared verbatim for two reasons: arguments can be
+// large, and they can contain values that must not be duplicated into a
+// second column. A digest is enough to answer the only question asked of it —
+// "are these the same arguments a human saw" — and nothing more.
+func FingerprintArgs(raw []byte) string {
+	if len(raw) == 0 {
+		// Distinct from a hash of empty input, so "no arguments" and "argument
+		// list that happens to hash to X" cannot be confused.
+		return "none"
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:16])
+}
 
 // ChannelUser maps an external IM identity to an internal one and carries the
 // attributes permission checks read.

@@ -87,18 +87,152 @@ func (s *Store) CreateToolApproval(ctx context.Context, a *types.ToolApproval) e
 	const q = `
 INSERT INTO tool_approvals
   (approval_id, tenant_id, agent_app_id, session_id, request_id, trace_id,
-   tool_name, tool_args, requested_by, state, expires_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+   tool_name, tool_args, requested_by, state, args_fingerprint, expires_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err = s.db.ExecContext(ctx, q,
 		a.ApprovalID, a.TenantID, a.AgentAppID, a.SessionID, a.RequestID,
 		nullString(a.TraceID), a.ToolName, args, nullString(a.RequestedBy),
-		a.State, nullTime(a.ExpiresAt),
+		a.State, nullString(a.ArgsFingerprint), nullTime(a.ExpiresAt),
 	)
 	if err != nil {
 		return fmt.Errorf("insert tool approval: %w", err)
 	}
 	return nil
+}
+
+// ClaimToolApproval atomically spends an approved request on one execution.
+//
+// This is the function that makes confirmation actually work, and its
+// atomicity is the whole point. The UPDATE moves approved→consumed in one
+// statement and reports whether it won, so two concurrent calls cannot both
+// see "approved" and both proceed. A read-then-check in Go would let exactly
+// that happen, and the effect would be the dangerous tool running twice on a
+// single human approval.
+//
+// The fingerprint is part of the WHERE, not checked afterwards: an approval
+// authorises the arguments that were reviewed, not the tool in general.
+//
+// Returns false with no error when there is nothing to claim — no approval,
+// still pending, already spent, rejected or expired. All of those mean "do
+// not run", and the caller does not need to tell them apart to make that
+// decision.
+func (s *Store) ClaimToolApproval(
+	ctx context.Context,
+	tenantID, sessionID, toolName, fingerprint string,
+) (bool, error) {
+	// expires_at is checked here rather than by a sweeper so an expired
+	// approval cannot be spent in the window before any sweep runs.
+	const q = `
+UPDATE tool_approvals
+   SET state = 'consumed'
+ WHERE tenant_id = ? AND session_id = ? AND tool_name = ?
+   AND args_fingerprint = ? AND state = 'approved'
+   AND (expires_at IS NULL OR expires_at > NOW(3))
+ ORDER BY id
+ LIMIT 1`
+
+	res, err := s.db.ExecContext(ctx, q, tenantID, sessionID, toolName, fingerprint)
+	if err != nil {
+		return false, fmt.Errorf("claim approval for %s/%s: %w", sessionID, toolName, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rows affected claiming approval: %w", err)
+	}
+	return n == 1, nil
+}
+
+// PendingToolApprovals lists a tenant's unanswered confirmation requests.
+//
+// Expired rows are filtered out rather than shown, so an operator is not
+// offered a decision that can no longer take effect.
+func (s *Store) PendingToolApprovals(ctx context.Context, tenantID string, limit int) ([]types.ToolApproval, error) {
+	const q = `
+SELECT approval_id, tenant_id, COALESCE(agent_app_id,''), session_id, request_id,
+       COALESCE(trace_id,''), tool_name, tool_args, COALESCE(requested_by,''),
+       COALESCE(decided_by,''), state, COALESCE(reason,''),
+       COALESCE(args_fingerprint,''), expires_at
+  FROM tool_approvals
+ WHERE tenant_id = ? AND state = 'pending'
+   AND (expires_at IS NULL OR expires_at > NOW(3))
+ ORDER BY id DESC
+ LIMIT ?`
+
+	rows, err := s.db.QueryContext(ctx, q, tenantID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query pending approvals for %s: %w", tenantID, err)
+	}
+	defer rows.Close()
+
+	var out []types.ToolApproval
+	for rows.Next() {
+		var (
+			a   types.ToolApproval
+			raw []byte
+		)
+		if err := rows.Scan(&a.ApprovalID, &a.TenantID, &a.AgentAppID, &a.SessionID,
+			&a.RequestID, &a.TraceID, &a.ToolName, &raw, &a.RequestedBy,
+			&a.DecidedBy, &a.State, &a.Reason, &a.ArgsFingerprint, &a.ExpiresAt); err != nil {
+			return nil, fmt.Errorf("scan approval: %w", err)
+		}
+		if err := decodeJSON(raw, &a.ToolArgs); err != nil {
+			return nil, fmt.Errorf("decode args for %s: %w", a.ApprovalID, err)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ToolApprovalByID reads one request, for the decision endpoint to echo back
+// what was decided.
+func (s *Store) ToolApprovalByID(ctx context.Context, tenantID, approvalID string) (*types.ToolApproval, error) {
+	const q = `
+SELECT approval_id, tenant_id, COALESCE(agent_app_id,''), session_id, request_id,
+       COALESCE(trace_id,''), tool_name, tool_args, COALESCE(requested_by,''),
+       COALESCE(decided_by,''), state, COALESCE(reason,''),
+       COALESCE(args_fingerprint,''), expires_at
+  FROM tool_approvals WHERE tenant_id = ? AND approval_id = ?`
+
+	var (
+		a   types.ToolApproval
+		raw []byte
+	)
+	err := s.db.QueryRowContext(ctx, q, tenantID, approvalID).Scan(
+		&a.ApprovalID, &a.TenantID, &a.AgentAppID, &a.SessionID, &a.RequestID,
+		&a.TraceID, &a.ToolName, &raw, &a.RequestedBy, &a.DecidedBy,
+		&a.State, &a.Reason, &a.ArgsFingerprint, &a.ExpiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("approval %s: %w", approvalID, ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query approval %s: %w", approvalID, err)
+	}
+	if err := decodeJSON(raw, &a.ToolArgs); err != nil {
+		return nil, fmt.Errorf("decode args for %s: %w", approvalID, err)
+	}
+	return &a, nil
+}
+
+// ExpireStaleApprovals marks unanswered requests past their deadline.
+//
+// Expired is a distinct state from rejected so that reviewing history can
+// tell "nobody answered" apart from "somebody said no" — they call for
+// different follow-up.
+func (s *Store) ExpireStaleApprovals(ctx context.Context) (int64, error) {
+	const q = `
+UPDATE tool_approvals SET state = 'expired'
+ WHERE state = 'pending' AND expires_at IS NOT NULL AND expires_at <= NOW(3)`
+
+	res, err := s.db.ExecContext(ctx, q)
+	if err != nil {
+		return 0, fmt.Errorf("expire stale approvals: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("rows affected expiring approvals: %w", err)
+	}
+	return n, nil
 }
 
 // ResolveToolApproval records a decision on a pending confirmation.

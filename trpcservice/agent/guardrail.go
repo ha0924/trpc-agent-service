@@ -80,14 +80,29 @@ func toolWhitelist(binding types.ExtensionBinding, mp *MountPoints) error {
 
 // dangerousToolApproval holds a tool marked "ask" until it is confirmed.
 //
-// The order here is the whole point. The approval row is written *before* the
-// call is allowed to proceed, never after: if the process dies between intent
-// and effect, the record of what was attempted still exists. An audit written
-// after the fact is precisely the one missing when something goes wrong.
+// A gated call takes two turns, and that is inherent rather than a shortcut:
 //
-// Phase one records the intent and refuses the call, so a dangerous tool
-// cannot run unattended. Wiring an approval channel replaces the refusal with
-// a wait; the ordering constraint does not change.
+//	turn 1  no approval on file → record the request, refuse, tell the user
+//	        (a human then approves through the Admin API)
+//	turn 2  the user asks again → the approval is claimed → the tool runs
+//
+// It cannot be one turn. Blocking inside the callback would hold a Worker slot
+// and the session lease for as long as a human takes to decide, and the lease
+// would expire mid-wait and hand the session to another Worker.
+//
+// Two ordering constraints, both load-bearing:
+//
+//   - The approval row is written *before* the call is refused, never after.
+//     If the process dies between intent and effect, the record of what was
+//     attempted still exists. An audit written after the fact is precisely the
+//     one missing when something goes wrong.
+//   - The claim is a single atomic UPDATE (approved→consumed), not a read
+//     followed by a check. Two concurrent calls must not both see "approved"
+//     and both run the tool on one human's approval.
+//
+// One approval buys exactly one execution. Without the consumed state,
+// confirming once would permanently disable the gate — worse than having no
+// gate, because it still looks like one.
 func dangerousToolApproval(binding types.ExtensionBinding, mp *MountPoints) error {
 	if mp.Tool == nil {
 		return fmt.Errorf("dangerous_tool_approval needs tool mount points")
@@ -106,6 +121,16 @@ func dangerousToolApproval(binding types.ExtensionBinding, mp *MountPoints) erro
 	}
 
 	ttl := durationParam(binding.Params, "approval_ttl", 10*time.Minute)
+	approvals := mp.Deps.Approvals
+
+	if approvals == nil {
+		// No store wired, so nothing could ever be approved. Say so once at
+		// assembly instead of letting every call look like it might be
+		// approvable — this is exactly the "configured but inert" shape that
+		// has bitten this project before.
+		mp.Logger.Warn("dangerous_tool_approval has no approval store; gated tools will always be refused",
+			"tools", len(needsApproval))
+	}
 
 	mp.Tool.RegisterBeforeTool(func(ctx context.Context, args *tool.BeforeToolArgs) (*tool.BeforeToolResult, error) {
 		if !needsApproval[args.ToolName] {
@@ -113,15 +138,73 @@ func dangerousToolApproval(binding types.ExtensionBinding, mp *MountPoints) erro
 		}
 
 		rc, _ := types.FromContext(ctx)
+		log := loggerFor(ctx, mp.Logger)
+
+		// The fingerprint binds an approval to the arguments a human actually
+		// reviewed. Without it, approving "delete order 123" would authorise
+		// "delete order 999" — the guardrail would only see that the tool has
+		// an approved row.
+		fingerprint := types.FingerprintArgs(args.Arguments)
+
+		// Turn 2: is there an approval for exactly this call?
+		if approvals != nil {
+			claimed, err := approvals.ClaimToolApproval(ctx,
+				tenantOf(rc), sessionOf(rc), args.ToolName, fingerprint)
+			if err != nil {
+				// Unknown whether an approval exists. Refusing is the only
+				// safe reading: proceeding could run a dangerous tool nobody
+				// approved, and the cost of refusing is one retry.
+				log.Error("claiming tool approval failed, refusing the call",
+					"tool", args.ToolName, "error", applog.Scrub(err.Error()))
+				return refuseUnapproved(ctx, mp, rc, args.ToolName,
+					"approval lookup failed"), nil
+			}
+			if claimed {
+				auditRecordSync(ctx, mp, &types.AuditRecord{
+					TenantID: tenantOf(rc), AgentAppID: agentAppOf(rc),
+					Channel: channelOf(rc), UserID: userOf(rc),
+					SessionID: sessionOf(rc), RequestID: requestOf(rc), TraceID: traceOf(rc),
+					EventType: types.AuditToolCall, ToolName: args.ToolName,
+					Decision: types.DecisionAllow,
+					Reason:   "dangerous tool ran against a claimed approval",
+					Detail: map[string]any{
+						"args_fingerprint": fingerprint,
+						"arguments":        redactArguments(args.Arguments),
+					},
+				})
+				log.Warn("dangerous tool authorised by a claimed approval",
+					"tool", args.ToolName, "fingerprint", fingerprint)
+				// nil lets the call through to the real tool.
+				return nil, nil
+			}
+		}
+
+		// Turn 1: nothing on file. Record the request, then refuse.
 		approvalID := "apr-" + uuid.NewString()
 		expires := time.Now().Add(ttl)
-
-		// Arguments are redacted before they are stored: an approval row is
-		// read by more people and kept longer than a log line.
 		redactedArgs := redactArguments(args.Arguments)
 
-		// Recorded synchronously and durably. This must not go through the
-		// async sink, whose buffer may drop under load.
+		if approvals != nil {
+			// Written before refusing, and synchronously: an approval nobody
+			// can find is an approval nobody can grant.
+			if err := approvals.CreateToolApproval(ctx, &types.ToolApproval{
+				ApprovalID: approvalID,
+				TenantID:   tenantOf(rc), AgentAppID: agentAppOf(rc),
+				SessionID: sessionOf(rc), RequestID: requestOf(rc), TraceID: traceOf(rc),
+				ToolName:    args.ToolName,
+				ToolArgs:    map[string]any{"redacted": redactedArgs},
+				RequestedBy: userOf(rc),
+				State:       types.ApprovalPending,
+				// The same fingerprint the claim will match on, so the
+				// approval can only be spent on this exact call.
+				ArgsFingerprint: fingerprint,
+				ExpiresAt:       &expires,
+			}); err != nil {
+				log.Error("recording tool approval failed",
+					"tool", args.ToolName, "error", applog.Scrub(err.Error()))
+			}
+		}
+
 		auditRecordSync(ctx, mp, &types.AuditRecord{
 			TenantID: tenantOf(rc), AgentAppID: agentAppOf(rc),
 			Channel: channelOf(rc), UserID: userOf(rc),
@@ -130,26 +213,59 @@ func dangerousToolApproval(binding types.ExtensionBinding, mp *MountPoints) erro
 			Decision: types.DecisionAsk,
 			Reason:   "dangerous tool requires confirmation",
 			Detail: map[string]any{
-				"approval_id": approvalID,
-				"arguments":   redactedArgs,
-				"expires_at":  expires.Format(time.RFC3339),
+				"approval_id":      approvalID,
+				"args_fingerprint": fingerprint,
+				"arguments":        redactedArgs,
+				"expires_at":       expires.Format(time.RFC3339),
 			},
 		})
 
-		loggerFor(ctx, mp.Logger).Warn("dangerous tool held for confirmation",
-			"tool", args.ToolName, "approval_id", approvalID)
+		log.Warn("dangerous tool held for confirmation",
+			"tool", args.ToolName, "approval_id", approvalID,
+			"fingerprint", fingerprint)
+
+		if mp.Deps.Metrics != nil {
+			mp.Deps.Metrics.ToolDenied(ctx, args.ToolName)
+		}
 
 		return &tool.BeforeToolResult{
 			CustomResult: map[string]any{
 				"status":      "awaiting_approval",
 				"approval_id": approvalID,
 				"detail": fmt.Sprintf(
-					"工具 %s 属于高风险操作，已记录待确认请求 %s，确认后才会执行。",
+					"工具 %s 属于高风险操作，已记录待确认请求 %s。"+
+						"经审批放行后重新发起同样的请求即会执行。",
 					args.ToolName, approvalID),
 			},
 		}, nil
 	})
 	return nil
+}
+
+// refuseUnapproved builds the refusal returned when an approval cannot be
+// confirmed, and records it.
+//
+// A result rather than an error, so the agent can tell the user why instead of
+// the whole run failing — the same convention the whitelist uses.
+func refuseUnapproved(
+	ctx context.Context,
+	mp *MountPoints,
+	rc *types.RequestContext,
+	toolName, reason string,
+) *tool.BeforeToolResult {
+	auditRecordSync(ctx, mp, &types.AuditRecord{
+		TenantID: tenantOf(rc), AgentAppID: agentAppOf(rc),
+		Channel: channelOf(rc), UserID: userOf(rc),
+		SessionID: sessionOf(rc), RequestID: requestOf(rc), TraceID: traceOf(rc),
+		EventType: types.AuditToolCall, ToolName: toolName,
+		Decision: types.DecisionDeny, Reason: reason,
+	})
+	return &tool.BeforeToolResult{
+		CustomResult: map[string]any{
+			"status": "refused",
+			"detail": fmt.Sprintf("工具 %s 未获授权，本次调用被拒绝。", toolName),
+		},
+	}
 }
 
 // ---------------------------------------------------------------------------

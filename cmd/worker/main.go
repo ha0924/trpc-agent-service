@@ -137,7 +137,10 @@ func run() error {
 			Budget:  budgetCounter{sched},
 			Tenants: db,
 			Users:   db,
-			Metrics: recorder,
+			// Without this the approval guardrail can only refuse, which is
+			// safe but leaves the tool permanently unusable.
+			Approvals: db,
+			Metrics:   recorder,
 		},
 		Logger: logger,
 	})

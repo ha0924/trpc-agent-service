@@ -124,7 +124,31 @@ func (s *Sweeper) Run(ctx context.Context) {
 			if n := s.retryDeliveries(ctx); n > 0 {
 				s.log.Info("replies redelivered", "count", n)
 			}
+			s.expireApprovals(ctx)
 		}
+	}
+}
+
+// expireApprovals marks unanswered confirmation requests past their deadline.
+//
+// Runs here rather than only being checked at claim time so that history
+// distinguishes "nobody answered" from "somebody said no" — those call for
+// different follow-up, and a row left pending forever says neither.
+//
+// The claim path also filters on expires_at, so this is bookkeeping rather
+// than a safety mechanism: an expired approval could not be spent even if
+// this never ran.
+func (s *Sweeper) expireApprovals(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	n, err := s.store.ExpireStaleApprovals(ctx)
+	if err != nil {
+		s.log.Warn("expiring stale approvals failed", "error", applog.Scrub(err.Error()))
+		return
+	}
+	if n > 0 {
+		s.log.Info("tool approvals expired unanswered", "count", n)
 	}
 }
 

@@ -77,6 +77,116 @@ func (a *API) registerControl(g *gin.RouterGroup) {
 	// audited security action, not a routine edit.
 	g.GET("/tenants/:tenant/audit-policy", a.getAuditPolicy)
 	g.PUT("/tenants/:tenant/audit-policy", a.putAuditPolicy)
+
+	// Dangerous-tool confirmation. This is the channel that turns the
+	// approval guardrail from "always refuse" into an actual gate.
+	g.GET("/tenants/:tenant/approvals", a.listApprovals)
+	g.POST("/tenants/:tenant/approvals/:approval/decide", a.decideApproval)
+}
+
+// ---------------------------------------------------------------------------
+// Dangerous-tool approvals
+// ---------------------------------------------------------------------------
+
+// listApprovals shows the unanswered confirmation requests.
+//
+// Expired rows are filtered out by the store, so an operator is never offered
+// a decision that can no longer take effect.
+func (a *API) listApprovals(c *gin.Context) {
+	rows, err := a.store.PendingToolApprovals(
+		c.Request.Context(), c.Param("tenant"), limitFrom(c, 50))
+	if a.fail(c, err) {
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"approvals": rows,
+		"note":      "approving does not run the tool; the user must ask again",
+	})
+}
+
+type decideApprovalRequest struct {
+	// Decision is "approve" or "reject". Spelled as verbs rather than a
+	// boolean so a malformed body cannot default to approval.
+	Decision  string `json:"decision"`
+	DecidedBy string `json:"decided_by"`
+	Reason    string `json:"reason"`
+}
+
+// decideApproval answers one pending request.
+//
+// Approving does not execute anything. The tool runs on the *next* call that
+// matches the approval, which is what keeps the decision out of the request
+// path: blocking a Worker while a human decides would hold the session lease
+// until it expired, handing the conversation to another Worker mid-wait.
+//
+// The response says so explicitly, because "I approved it, why did nothing
+// happen" is the obvious first confusion.
+func (a *API) decideApproval(c *gin.Context) {
+	var req decideApprovalRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	if !required(c, "decided_by", req.DecidedBy) {
+		return
+	}
+
+	var state types.ApprovalState
+	switch req.Decision {
+	case "approve":
+		state = types.ApprovalApproved
+	case "reject":
+		state = types.ApprovalRejected
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "decision must be approve or reject, got " + req.Decision,
+		})
+		return
+	}
+
+	ctx := c.Request.Context()
+	tenant, approvalID := c.Param("tenant"), c.Param("approval")
+
+	// Read first so the tenant scope is checked before the update: without
+	// it, one tenant could decide another's approval by guessing an id.
+	existing, err := a.store.ToolApprovalByID(ctx, tenant, approvalID)
+	if a.fail(c, err) {
+		return
+	}
+	if existing.State != types.ApprovalPending {
+		// Already answered. Refusing a second decision is what stops a
+		// rejected call from being quietly re-approved.
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "approval is already " + string(existing.State),
+		})
+		return
+	}
+
+	if err := a.store.ResolveToolApproval(ctx, approvalID, state, req.DecidedBy, req.Reason); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// Lost a race with another decider between the read and the
+			// update. The other decision stands.
+			c.JSON(http.StatusConflict, gin.H{"error": "approval was decided concurrently"})
+			return
+		}
+		a.failWrite(c, err)
+		return
+	}
+
+	a.log.Warn("tool approval decided",
+		"tenant_id", tenant, "approval_id", approvalID,
+		"tool", existing.ToolName, "decision", state, "decided_by", req.DecidedBy)
+
+	note := "rejected; the tool will stay refused"
+	if state == types.ApprovalApproved {
+		note = "approved for one execution of these exact arguments; " +
+			"ask the agent again to run it"
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"approval_id": approvalID,
+		"tool_name":   existing.ToolName,
+		"state":       state,
+		"note":        note,
+	})
 }
 
 // ---------------------------------------------------------------------------

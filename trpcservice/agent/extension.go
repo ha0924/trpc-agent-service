@@ -48,10 +48,32 @@ type PolicyDeps struct {
 	Budget  BudgetCounter
 	Tenants TenantSettingsLoader
 	Users   ChannelUserLoader
+	// Approvals persists and spends dangerous-tool confirmations. Nil turns
+	// the approval guardrail into an unconditional refusal — safe, but the
+	// tool becomes unusable, so the assembler logs it.
+	Approvals ApprovalStore
 	// Metrics receives model and tool timings. Nil disables that recording
 	// rather than failing assembly: instrumentation must never be the reason
 	// an agent cannot be built.
 	Metrics MetricsRecorder
+}
+
+// ApprovalStore is the confirmation half of the dangerous-tool guardrail.
+//
+// Two methods rather than one because they answer at different moments: the
+// claim happens on the *next* call after a human decided, not during the call
+// that triggered the request. A dangerous tool call therefore always takes two
+// turns — the first records intent and refuses, the second spends the approval.
+type ApprovalStore interface {
+	// CreateToolApproval records a pending request. It must return only after
+	// the row is durable: a crash between intent and effect has to leave
+	// evidence of what was attempted.
+	CreateToolApproval(ctx context.Context, a *types.ToolApproval) error
+
+	// ClaimToolApproval atomically spends one approved request, reporting
+	// whether it won. Atomicity is what stops two concurrent calls from both
+	// seeing "approved" and both running the tool on a single approval.
+	ClaimToolApproval(ctx context.Context, tenantID, sessionID, toolName, fingerprint string) (bool, error)
 }
 
 // MetricsRecorder receives the timings taken inside framework callbacks.

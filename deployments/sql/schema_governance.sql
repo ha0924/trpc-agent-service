@@ -71,8 +71,11 @@ CREATE TABLE IF NOT EXISTS tool_approvals (
   tool_args      JSON         NULL COMMENT '已脱敏的调用参数',
   requested_by   VARCHAR(64)  NULL COMMENT '触发调用的 IM 用户',
   decided_by     VARCHAR(64)  NULL,
-  state          VARCHAR(16)  NOT NULL DEFAULT 'pending' COMMENT 'pending / approved / rejected / expired',
+  state          VARCHAR(16)  NOT NULL DEFAULT 'pending' COMMENT 'pending / approved / rejected / expired / consumed',
   reason         VARCHAR(512) NULL,
+  -- 绑定审批与「当时被展示的那组参数」。缺了它，批准「删除订单 123」
+  -- 会顺带授权「删除订单 999」——guardrail 只会看到该工具有一条已批准记录。
+  args_fingerprint VARCHAR(64) NULL COMMENT '参数摘要，使审批只对被审的那次调用有效',
   expires_at     DATETIME(3)  NULL,
   created_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
