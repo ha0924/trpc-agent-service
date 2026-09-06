@@ -114,7 +114,8 @@ secrets:
     "secret://prod/tenant-demo/channel/wecom": WECOM_CREDENTIALS
     # 智能机器人长连接的凭据结构不同：只含 bot_id / secret，
     # 没有 token 与 encoding_aes_key——长连接明文传输，无需验签与解密。
-    "secret://prod/tenant-demo/channel/wecom-aibot": WECOM_AIBOT_CREDENTIALS
+    "secret://prod/tenant-test/channel/wecom-aibot": WECOM_AIBOT_CREDENTIALS
+    "secret://prod/tenant-test/model/primary-api-key": TEST_API_KEY
     # 第二个租户，密钥各自独立——一个租户的密钥解析不到，
     # 只影响该租户，不会波及其他租户。
     "secret://prod/tenant-acme/model/primary-api-key": ACME_API_KEY
