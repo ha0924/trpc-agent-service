@@ -146,6 +146,9 @@ func NewExtensionRegistry() *ExtensionRegistry {
 	r.Register("redaction", redaction)
 	r.Register("budget_limit", budgetLimit)
 	r.Register("user_permission", userPermission)
+	// Injects an operation key into tools that declare side effects, so a
+	// redelivered request cannot cause the effect twice. See 风险清单 #2.
+	r.Register("operation_idempotency", operationIdempotency)
 	return r
 }
 

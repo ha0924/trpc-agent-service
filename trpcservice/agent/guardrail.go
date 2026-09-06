@@ -559,6 +559,12 @@ func redactArguments(raw []byte) string {
 	return applog.Scrub(string(out))
 }
 
+// errNeedsToolMountPoints keeps the several "needs tool mount points" errors
+// identical, so a grep for one finds them all.
+func errNeedsToolMountPoints(ext string) error {
+	return fmt.Errorf("%s needs tool mount points", ext)
+}
+
 func boolParam(params map[string]any, key string, def bool) bool {
 	if params == nil {
 		return def

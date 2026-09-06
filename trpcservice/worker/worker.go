@@ -391,6 +391,11 @@ func (w *Worker) processMessage(
 		TraceID:          msg.TraceID,
 	}
 	ctx = types.NewContext(ctx, rc)
+	// One counter per request, so a side-effect tool's operation key is stable
+	// across retries of this message yet distinct between its own calls. It
+	// lives in the context because the framework hands callbacks a derived
+	// one, and a plain int would be copied and lost.
+	ctx = types.WithOperationCounter(ctx, types.NewOperationCounter())
 	log = applog.With(w.log, rc).With("worker_id", w.id)
 
 	// Persist the user's turn before running, so the conversation is on record
