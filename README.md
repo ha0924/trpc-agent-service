@@ -275,7 +275,7 @@ docker compose -f deployments/docker-compose.yml up --build
 | Session 租约与信箱、跨节点顺序保证 | ✅ |
 | 配置驱动的 Runtime 装配与缓存 | ✅ |
 | 多租户隔离（同名同版本对抗性验证） | ✅ |
-| Storage Router，实现框架 `session.Service` | ✅ Redis + InMemory 两后端 |
+| Storage Router，实现框架 `session.Service` | ✅ Redis / MySQL / InMemory 三后端，按租户路由 |
 | IM 通道 | ✅ Mock、企业微信 |
 | 治理五策略 | ✅ 工具白名单、脱敏、预算、危险工具确认、用户权限 |
 | 审计日志（11 字段）与 Usage 记录 | ✅ |
@@ -283,7 +283,12 @@ docker compose -f deployments/docker-compose.yml up --build
 | Admin API、灰度与回滚 | ✅ |
 | OpenTelemetry 跨进程 trace | ✅ 一条消息一棵树，Worker span 挂在 Gateway span 之下 |
 | 死信队列与对账扫描 | ✅ 毒消息隔离、重放、滞留请求重投 |
+| 运维控制台 | ✅ 对话、租户配置、灰度回滚、死信重放 |
 | 向量库与对象存储后端、Graph 编排、MCP、Skill | 结构已留，实现按迭代计划推进 |
 
 模型未接入时回退到占位模型，是为了让整条链路在没有供应商账号的情况下也可验证。
 占位模型在输出里明确声明自己未接入，避免被误认成真实回答。
+
+**逐项完成度、未完成项及其原因见 [`docs/完成度台账.md`](docs/完成度台账.md)。**
+上表只标「有没有」，台账标「到什么程度」——包括企业微信长连接模式未实现、
+Memory 与 Summary 只有接口位没有实现等已知缺口。
