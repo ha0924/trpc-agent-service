@@ -34,6 +34,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/store"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/types"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/web"
 )
 
 // Deps are the collaborators a Gateway needs.
@@ -110,6 +111,11 @@ func (g *Gateway) Router() *gin.Engine {
 	// with a public listener and a database connection; Workers expose
 	// nothing callable.
 	admin.New(g.store, g.deadLetter, g.log).Register(r)
+
+	// The operator console. It posts to the real webhook endpoint rather than
+	// to a private shortcut, so a working console is itself evidence the
+	// platform works.
+	web.New(g.store, g.log).Register(r)
 
 	r.Any("/webhook/*path", g.handleWebhook)
 	return r

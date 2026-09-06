@@ -5,7 +5,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -254,4 +256,76 @@ SELECT COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens)
 		return nil, fmt.Errorf("summarise usage for %s: %w", tenantID, err)
 	}
 	return out, nil
+}
+
+// SessionEventRow is one turn of a conversation as shown in the UI.
+type SessionEventRow struct {
+	Sequence  int64     `json:"sequence"`
+	EventType string    `json:"event_type"`
+	Role      string    `json:"role"`
+	Text      string    `json:"text"`
+	Tool      string    `json:"tool"`
+	RequestID string    `json:"request_id"`
+	TraceID   string    `json:"trace_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// SessionEvents returns a conversation in order.
+//
+// Read from the platform's own session_events rather than from the framework's
+// session service on purpose: this table is the durable history the platform
+// owns, ordered by a sequence the database enforces. The framework's backend
+// is that backend's internal storage and may be Redis, where history is
+// expendable.
+func (s *Store) SessionEvents(ctx context.Context, tenantID, sessionID string, limit int) ([]SessionEventRow, error) {
+	const q = `
+SELECT sequence, event_type, COALESCE(role, ''),
+       COALESCE(JSON_UNQUOTE(JSON_EXTRACT(content, '$.text')), ''),
+       COALESCE(JSON_UNQUOTE(JSON_EXTRACT(content, '$.tool')), ''),
+       request_id, COALESCE(trace_id, ''), created_at
+  FROM session_events
+ WHERE tenant_id = ? AND session_id = ?
+ ORDER BY sequence
+ LIMIT ?`
+
+	rows, err := s.db.QueryContext(ctx, q, tenantID, sessionID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query session events for %s: %w", sessionID, err)
+	}
+	defer rows.Close()
+
+	var out []SessionEventRow
+	for rows.Next() {
+		var r SessionEventRow
+		if err := rows.Scan(&r.Sequence, &r.EventType, &r.Role,
+			&r.Text, &r.Tool, &r.RequestID, &r.TraceID, &r.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan session event: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// InboundState reports where one request has got to, so the UI can tell
+// "still working" apart from "failed".
+//
+// Without it a browser that polls for a reply cannot distinguish a slow model
+// call from a request that already died, and would wait forever on the latter.
+func (s *Store) InboundState(ctx context.Context, requestID string) (types.InboundState, string, error) {
+	const q = `
+SELECT state, COALESCE(last_error, '') FROM inbound_events
+ WHERE request_id = ? ORDER BY id DESC LIMIT 1`
+
+	var (
+		state   string
+		lastErr string
+	)
+	err := s.db.QueryRowContext(ctx, q, requestID).Scan(&state, &lastErr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", fmt.Errorf("request %s: %w", requestID, ErrNotFound)
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("query inbound state for %s: %w", requestID, err)
+	}
+	return types.InboundState(state), lastErr, nil
 }
