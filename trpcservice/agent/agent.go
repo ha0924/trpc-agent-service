@@ -389,11 +389,39 @@ func (p *Provider) buildModel(spec *types.RuntimeSpec) (model.Model, string) {
 		return newEchoModel(spec.ModelName, reason), "stub"
 	}
 
+	primary := p.newModelClient(spec.ModelName, apiKey)
+
+	// A fallback is a model name, not a second credential set: it shares the
+	// tenant's key and base URL, and asking an operator to restate those
+	// invites them to drift apart.
+	var fallback model.Model
+	if name := fallbackModelName(spec.ModelParams); name != "" && name != spec.ModelName {
+		fallback = p.newModelClient(name, apiKey)
+		p.log.Info("fallback model configured",
+			"key", spec.Key.String(), "primary", spec.ModelName, "fallback", name)
+	}
+
+	// Wrapped rather than reimplemented inside the assembler: retry, breaker
+	// and fallback are one concern, and putting them behind model.Model means
+	// the framework's Runner needs to know nothing about them.
+	//
+	// 风险清单 #6 named all four mitigations; only timeout propagation
+	// existed before this. A provider outage therefore failed every request
+	// for its whole duration, and the retries of those failures made the
+	// throttling worse.
+	return newResilientModel(
+		primary, fallback, spec.ModelName,
+		resilienceFromParams(spec.ModelParams), p.log,
+	), "live"
+}
+
+// newModelClient builds one provider client.
+func (p *Provider) newModelClient(name, apiKey string) model.Model {
 	opts := []openai.Option{openai.WithAPIKey(apiKey)}
-	if baseURL, ok := p.cfg.ModelBaseURL(spec.ModelName); ok {
+	if baseURL, ok := p.cfg.ModelBaseURL(name); ok {
 		opts = append(opts, openai.WithBaseURL(baseURL))
 	}
-	return openai.New(spec.ModelName, opts...), "live"
+	return openai.New(name, opts...)
 }
 
 // generationConfig maps the version's stored model parameters onto the
