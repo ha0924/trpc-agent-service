@@ -249,7 +249,9 @@ fetch  型：Decode 内部调用同步接口，按游标拉取，可能一次返
 
 一期实现 Mock Channel（HTTP 收发），但接口与能力描述符按真实通道的形状定义，保证接入真实通道时不调整结构。
 
-Telegram 可复用 `openclaw/plugins/telegram` 的实现并适配到平台 Channel 接口；企业微信为平台自研。二者一复用一自研，正好覆盖 `payload` 型与凭据换取两类差异。
+Telegram 需**自行实现** Bot API 协议：`openclaw/plugins/telegram` 只是 204 行的注册薄壳，协议实现在 `internal/` 下，Go 禁止外部模块引用（详见 [框架复用与扩展.md](框架复用与扩展.md) §2.5 的更正说明）。因此两个真实通道都是平台自研，可复用的只有 `channel.Channel` 接口。
+
+不过 Telegram 仍是补第二类的最低成本选项：纯 HTTPS，无验签、无 AES 解密、Bot Token 长期有效不需换取，且其差异维度（无需公网地址、原生支持编辑已发消息、群聊 `chat_id` 为负数）正好为 §7.1 的差异对比补一列真实数据。
 
 ## 8. 出站回复
 

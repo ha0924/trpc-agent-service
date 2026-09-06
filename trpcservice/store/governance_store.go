@@ -20,7 +20,14 @@ import (
 // Callers that must not be blocked should use AsyncAuditSink instead — but
 // anything recording a dangerous tool has to use this, because the record has
 // to be durable before the side effect runs.
+//
+// The tenant's audit policy is applied here rather than at each call site.
+// That is deliberate: a rule enforced by convention gets forgotten at the one
+// call site that matters, and this function is the single choke point every
+// record passes through.
 func (s *Store) WriteAudit(ctx context.Context, r *types.AuditRecord) error {
+	s.applyAuditPolicy(ctx, r)
+
 	detail, err := encodeJSON(r.Detail)
 	if err != nil {
 		return fmt.Errorf("encode audit detail: %w", err)

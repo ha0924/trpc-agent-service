@@ -84,6 +84,12 @@ func (a *API) Register(r *gin.Engine) {
 	// back into that conversation's mailbox.
 	g.GET("/sessions/:session/deadletters", a.listDeadLetters)
 	g.POST("/sessions/:session/deadletters/replay", a.replayDeadLetter)
+
+	// The write half lives in control.go. Kept in its own file because the
+	// read endpoints are thin pass-throughs while the writes carry three
+	// layers of validation, and mixing them made it hard to see which
+	// endpoints can change state.
+	a.registerControl(g)
 }
 
 func (a *API) listDeadLetters(c *gin.Context) {

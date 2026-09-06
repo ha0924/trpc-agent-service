@@ -163,3 +163,35 @@ CREATE TABLE IF NOT EXISTS channel_users (
   UNIQUE KEY uk_channel_user (channel_binding_id, external_user_id),
   KEY idx_internal (tenant_id, internal_user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='外部 IM 用户到内部用户的映射';
+
+-- ---------------------------------------------------------------------------
+-- 审计策略：租户模型的第 7 个要素
+--
+-- 设计依据：docs/治理监控与安全设计.md §8「密钥与脱敏」
+--
+-- 为什么需要按租户配置，而不是全局一套：不同租户对「审计里能留多少原文」
+-- 的要求相反。受监管行业要求留证据以便复查，注重隐私的租户要求正文一律
+-- 不落库、只留哈希。写死任何一种都会让另一类租户无法使用。
+--
+-- 三个字段各自对应一种真实诉求：
+--   redact_level  脱敏强度。none 只用于本地调试，生产最低 standard
+--   body_mode     正文如何留存：full 留原文 / truncate 截断 / hash 只留哈希 / drop 不留
+--   retention_days 保留天数，到期由对账任务清理
+--
+-- 注意：本表建好后必须被真正读取。本项目已四次出现「表和函数都在、
+-- 零调用点」的情况（见 docs/完成度台账.md §八 #4 #7 #9 #12），
+-- 因此审计写入路径会读它，而不是只建表。
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS audit_policies (
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  tenant_id      VARCHAR(64) NOT NULL,
+  redact_level   VARCHAR(32) NOT NULL DEFAULT 'standard' COMMENT 'none / standard / strict',
+  body_mode      VARCHAR(32) NOT NULL DEFAULT 'truncate' COMMENT 'full / truncate / hash / drop',
+  body_max_chars INT         NOT NULL DEFAULT 512 COMMENT 'body_mode=truncate 时的截断长度',
+  retention_days INT         NOT NULL DEFAULT 90,
+  created_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_audit_policy (tenant_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='租户级审计策略，租户模型第 7 要素';

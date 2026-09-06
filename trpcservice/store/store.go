@@ -45,6 +45,11 @@ const mysqlDuplicateEntry = 1062
 // Store holds the database handle.
 type Store struct {
 	db *sql.DB
+
+	// policies caches per-tenant audit policies, which are read on every
+	// audit write. Nil when built by NewWithDB, in which case reads go
+	// straight to the database.
+	policies *auditPolicyCache
 }
 
 // Open connects to MySQL and verifies the connection.
@@ -62,7 +67,10 @@ func Open(ctx context.Context, cfg config.MySQLConfig) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("ping mysql: %w", err)
 	}
-	return &Store{db: db}, nil
+	return &Store{
+		db:       db,
+		policies: &auditPolicyCache{entries: make(map[string]auditPolicyEntry)},
+	}, nil
 }
 
 // NewWithDB wraps an existing handle, for tests.
