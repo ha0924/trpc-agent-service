@@ -19,3 +19,9 @@ data/*
 # 本地配置含明文凭据，只提交示例文件
 configs/config.yaml
 configs/*.local.yaml
+
+# 密钥环境变量。一期的 Secret Manager 是环境变量，导出动作本身也需要
+# 一个落脚处；放文件里比每次手敲更不容易出错（漏一个 $ 就会静默失败），
+# 但它含明文，绝不入库。
+.env
+.env.local
