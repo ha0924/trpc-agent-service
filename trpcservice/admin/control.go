@@ -762,6 +762,32 @@ func (a *API) upsertBinding(c *gin.Context) {
 		return
 	}
 
+	// Outbound mode is validated separately because it is a separate
+	// question. A channel may dial out for inbound and still reply over an
+	// ordinary HTTPS call — Telegram does exactly that — so the two are not
+	// derivable from each other.
+	switch req.Capabilities.OutboundMode.Resolved() {
+	case types.OutboundModeDirect:
+	case types.OutboundModeViaHolder:
+		// Replies leaving through a held connection only make sense when
+		// there is a connection to hold. Otherwise the reply goes to an
+		// outbox nobody drains, and the user simply never hears back — a
+		// silent failure with every other signal green.
+		if req.Capabilities.InboundMode != types.InboundModeStream {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "outbound_mode=via_holder requires inbound_mode=stream",
+				"note":  "there is no held connection to reply through otherwise",
+			})
+			return
+		}
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "unknown outbound_mode " + string(req.Capabilities.OutboundMode),
+			"note":  "one of direct, via_holder",
+		})
+		return
+	}
+
 	b := &types.ChannelBinding{
 		ChannelBindingID: c.Param("binding"),
 		TenantID:         c.Param("tenant"),

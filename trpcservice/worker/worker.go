@@ -732,13 +732,16 @@ func (w *Worker) deliver(
 	// same way.
 	parts := splitText(reply, binding.Capabilities.MaxTextLength)
 
-	// A stream binding's reply can only leave through the socket it arrived
-	// on, which this process does not hold. It goes to the outbox instead,
+	// A reply that must leave through the socket it arrived on cannot be sent
+	// from here: this process holds no socket. It goes to the outbox instead,
 	// and the Gateway replica holding the connection sends it.
 	//
-	// The branch is on capabilities rather than on the channel name, so a
-	// second long-connection platform needs no change here.
-	if binding.Capabilities.StreamCapable() {
+	// The branch reads *outbound* mode, not inbound. Those were one field
+	// until Telegram made the difference concrete: it dials out for inbound
+	// but replies over an ordinary HTTPS call any Worker can make, so routing
+	// it through the outbox would add a hop and a per-bot election for
+	// nothing.
+	if binding.Capabilities.RepliesViaHolder() {
 		if err := w.deliverToOutbox(ctx, log, sess, msg, binding, parts); err != nil {
 			return false, err
 		}
@@ -785,10 +788,10 @@ func (w *Worker) deliverToOutbox(
 	parts []string,
 ) error {
 	if w.outbox == nil {
-		// Configuration gap rather than a runtime fault: a stream binding
-		// exists but the Worker was built without an outbox, so no reply
-		// could ever reach the user. Say so plainly.
-		return fmt.Errorf("stream binding %s requires an outbox, none configured",
+		// Configuration gap rather than a runtime fault: a binding replies
+		// via its connection holder but the Worker was built without an
+		// outbox, so no reply could ever reach the user. Say so plainly.
+		return fmt.Errorf("binding %s replies via its holder and requires an outbox, none configured",
 			binding.ChannelBindingID)
 	}
 

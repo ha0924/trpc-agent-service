@@ -16,7 +16,8 @@
 -- 长连接与回调模式的三处结构差异（详见 §9.1）：
 --   webhook_path 为 NULL —— 没有回调地址，Gateway 的 catch-all 路由不会命中；
 --   secret_ref 的凭据块只含 bot_id / secret —— 明文传输，无 token 与 aes key；
---   inbound_mode 为 stream —— 决定 Gateway 起 Run()、Worker 走出站信箱。
+--   inbound_mode 为 stream —— 决定 Gateway 是否为它起 Run()；
+--   outbound_mode 为 via_holder —— 决定 Worker 是否把回复投出站信箱。
 --
 -- 凭据不入库：明文只存在于 Secret Manager（一期是环境变量）。
 --
@@ -121,6 +122,10 @@ VALUES
    JSON_OBJECT(
      -- 由平台服务主动建连，服务端经该连接推送
      'inbound_mode',        'stream',
+     -- 出站必须经持连进程：回复要透传回调的 req_id，只有收到它的那条
+     -- 连接能做到。与 inbound_mode 分开声明，因为二者不可互推——
+     -- Telegram 也主动建连，但回复走普通 HTTPS，任意 Worker 都能发。
+     'outbound_mode',       'via_holder',
      -- aibot_send_msg 支持主动推送，前置条件是用户先发过消息
      'supports_push',       TRUE,
      -- 流式消息可反复刷新、卡片可更新，编辑是真实支持的

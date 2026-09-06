@@ -310,7 +310,12 @@ func (c *Channel) ID() string { return Name }
 // rate cap rather than a per-application one.
 func (c *Channel) Capabilities() types.Capabilities {
 	return types.Capabilities{
-		InboundMode:  types.InboundModeStream,
+		InboundMode: types.InboundModeStream,
+		// Replies must echo the callback's req_id, which only the connection
+		// that received it can do — so they cannot leave from a Worker. This
+		// is declared rather than inferred from the inbound mode: Telegram
+		// also dials out yet replies over an ordinary HTTPS call.
+		OutboundMode: types.OutboundModeViaHolder,
 		SupportsPush: true,
 		// Stream messages can be refreshed until finished, and template cards
 		// can be updated, so edits are genuinely supported here.

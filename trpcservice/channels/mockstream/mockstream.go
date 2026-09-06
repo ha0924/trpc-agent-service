@@ -72,7 +72,10 @@ func (c *Channel) ID() string { return Name }
 // directly — the two behaviours that distinguish this mode.
 func (c *Channel) Capabilities() types.Capabilities {
 	return types.Capabilities{
-		InboundMode:     types.InboundModeStream,
+		InboundMode: types.InboundModeStream,
+		// This mock exists to exercise the reversed reply path, so it declares
+		// via_holder explicitly.
+		OutboundMode:    types.OutboundModeViaHolder,
 		SupportsPush:    true,
 		SupportsEdit:    true,
 		MaxTextLength:   2048,

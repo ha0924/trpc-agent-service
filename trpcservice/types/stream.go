@@ -164,10 +164,25 @@ type ConnectionLease interface {
 	ReleaseConnection(ctx context.Context, channelBindingID, owner string) error
 }
 
-// StreamCapable reports whether a binding's capabilities put it in stream
-// mode. Used at startup to decide which bindings need a Run loop, and in the
-// Worker to decide whether a reply goes to the outbox or straight out over
-// HTTP.
+// StreamCapable reports whether a binding's inbound side is a long
+// connection the platform dials out, and therefore needs a Run loop with a
+// per-binding election.
+//
+// This answers "how do messages arrive". It does **not** answer where replies
+// go — see RepliesViaHolder. The two were one question until Telegram made
+// the difference concrete: it dials out for inbound but replies over an
+// ordinary HTTPS call.
 func (c Capabilities) StreamCapable() bool {
 	return c.InboundMode == InboundModeStream
+}
+
+// RepliesViaHolder reports whether a reply must leave through the process
+// holding this binding's connection.
+//
+// This is the question the Worker's delivery path asks. Reading outbound mode
+// rather than inbound mode is the whole point of splitting them: routing a
+// Telegram reply through the outbox would add a hop and a per-bot election
+// for a channel whose replies any Worker can send.
+func (c Capabilities) RepliesViaHolder() bool {
+	return c.OutboundMode.Resolved() == OutboundModeViaHolder
 }

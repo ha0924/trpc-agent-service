@@ -21,6 +21,25 @@ type Capabilities struct {
 	// must be pulled separately. WeCom customer service is the fetch case.
 	InboundMode InboundMode `json:"inbound_mode"`
 
+	// OutboundMode says how a reply leaves the platform, which is a separate
+	// question from how messages arrive.
+	//
+	// These were one field until a second long-connection channel made the
+	// conflation visible. WeCom's aibot happens to couple them — it pushes
+	// inbound over a socket *and* requires replies on that same socket — so
+	// one field described both correctly. Telegram's long polling does not:
+	// it pulls inbound but replies over an ordinary HTTPS call that any
+	// Worker can make.
+	//
+	// With one field, giving Telegram "stream" to express "we dial out" would
+	// also route its replies through the outbox and start a per-bot election,
+	// neither of which it needs. Two fields let a channel say "I fetch, and I
+	// reply directly".
+	//
+	// Empty means direct, so every existing binding keeps its behaviour
+	// without a migration.
+	OutboundMode OutboundMode `json:"outbound_mode,omitempty"`
+
 	// SupportsPush reports whether the channel can deliver a message the user
 	// did not just ask for. The whole ACK-then-reply-asynchronously design
 	// depends on this; a channel without it must fall back to answering
@@ -55,6 +74,39 @@ const (
 	// the connection. See types.StreamChannel.
 	InboundModeStream InboundMode = "stream"
 )
+
+// OutboundMode says how a reply leaves the platform.
+type OutboundMode string
+
+const (
+	// OutboundModeDirect means any Worker can deliver the reply itself,
+	// typically with an outbound HTTP call. This is the default and covers
+	// every callback channel plus long-polling ones like Telegram.
+	OutboundModeDirect OutboundMode = "direct"
+
+	// OutboundModeViaHolder means the reply can only leave through the
+	// process holding a live connection, so the Worker queues it to an outbox
+	// that the holder drains.
+	//
+	// Required when the platform ties a reply to the socket that received the
+	// message — WeCom's aibot echoes the callback's req_id, which only that
+	// connection can do. It costs an extra hop and a per-binding election, so
+	// it is opt-in rather than implied by dialling out.
+	OutboundModeViaHolder OutboundMode = "via_holder"
+)
+
+// Resolved reports the effective outbound mode.
+//
+// Empty resolves to direct, so bindings written before this field existed
+// keep working. Stream inbound does *not* imply via_holder: whether replies
+// must use the inbound socket is a property of the platform's protocol, not
+// of the fact that the platform dialled out.
+func (m OutboundMode) Resolved() OutboundMode {
+	if m == "" {
+		return OutboundModeDirect
+	}
+	return m
+}
 
 // AckInfo is what a channel may echo back in its immediate response.
 //
