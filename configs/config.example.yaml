@@ -120,6 +120,10 @@ secrets:
     # 企业微信的凭据是一个 JSON 块，含 corp_id / secret / agent_id /
     # token / encoding_aes_key。整体存在密钥管理器里，库中只留引用。
     "secret://prod/tenant-demo/channel/wecom": WECOM_CREDENTIALS
+    # Telegram 只有一个 bot token，无签名密钥也无 AES key。
+    # 它直接出现在 API 的 URL 路径里，因此比企业微信的凭据更敏感：
+    # 任何打印 URL 的日志都会泄漏整个凭据。
+    "secret://prod/tenant-demo/channel/telegram": TELEGRAM_BOT_TOKEN
     # 智能机器人长连接的凭据结构不同：只含 bot_id / secret，
     # 没有 token 与 encoding_aes_key——长连接明文传输，无需验签与解密。
     "secret://prod/tenant-test/channel/wecom-aibot": WECOM_AIBOT_CREDENTIALS

@@ -26,6 +26,7 @@ import (
 	platformagent "github.com/liuzengh/trpc-agent-service/trpcservice/agent"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/telegram"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecom"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
 	applog "github.com/liuzengh/trpc-agent-service/trpcservice/log"
@@ -176,6 +177,10 @@ func run() error {
 	// one place means one connection to reason about.
 	registry.Register(wecom.Name,
 		wecom.New(cfg.ResolveSecret, wecom.NewTokenManager(sched.Client(), logger), logger))
+	// Outbound only. Telegram replies are ordinary HTTPS calls any Worker can
+	// make, so unlike the aibot channel it needs no outbox and no connection
+	// holder — that is the distinction outbound mode now expresses.
+	registry.RegisterOutbound(telegram.Name, telegram.New(cfg.ResolveSecret, logger))
 	logger.Info("channels registered", "channels", registry.Names(), "reply_url", *replyURL)
 
 	w, err := worker.New(worker.Deps{

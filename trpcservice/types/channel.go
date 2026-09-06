@@ -160,6 +160,26 @@ type InboundChannel interface {
 	Capabilities() Capabilities
 }
 
+// ReplySender delivers a finished reply. It is the whole of what Worker needs
+// from a channel's outbound half.
+//
+// Narrower than OutboundChannel on purpose. OutboundChannel embeds openclaw's
+// Channel, which declares Run(ctx) error — and a stream channel's Run takes a
+// binding and a sink, so one type cannot satisfy both signatures. Telegram is
+// exactly that case: it long-polls for inbound (stream Run) yet replies over
+// an ordinary HTTPS call (direct outbound).
+//
+// Depending on the narrow interface means the registry accepts either shape,
+// and Worker depends on less than before rather than more.
+type ReplySender interface {
+	// Send delivers a reply to a channel-specific target. Target encoding is
+	// the channel's own: a user id, a chat id, a group id.
+	Send(ctx context.Context, target string, msg OutboundMessage, binding *ChannelBinding) error
+
+	// Capabilities reports this channel's fixed traits.
+	Capabilities() Capabilities
+}
+
 // OutboundChannel is the half that runs inside Worker: it delivers a finished
 // reply back to the user.
 //
@@ -168,13 +188,7 @@ type InboundChannel interface {
 // Worker knows when and what to reply.
 type OutboundChannel interface {
 	openclawchannel.Channel
-
-	// Send delivers a reply to a channel-specific target. Target encoding is
-	// the channel's own: a user id, a chat id, a group id.
-	Send(ctx context.Context, target string, msg OutboundMessage, binding *ChannelBinding) error
-
-	// Capabilities reports this channel's fixed traits.
-	Capabilities() Capabilities
+	ReplySender
 }
 
 // Channel is a channel implementation that covers both directions. A single
@@ -190,8 +204,11 @@ type Channel interface {
 type Registry interface {
 	// Inbound returns the inbound half for the named channel.
 	Inbound(name string) (InboundChannel, error)
-	// Outbound returns the outbound half for the named channel.
-	Outbound(name string) (OutboundChannel, error)
+	// Outbound returns the reply sender for the named channel.
+	//
+	// ReplySender rather than OutboundChannel so a stream channel — whose Run
+	// signature cannot match openclaw's — can still deliver replies.
+	Outbound(name string) (ReplySender, error)
 	// Names lists the registered channel names.
 	Names() []string
 }

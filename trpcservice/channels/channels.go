@@ -21,7 +21,7 @@ import (
 type Registry struct {
 	mu       sync.RWMutex
 	inbound  map[string]types.InboundChannel
-	outbound map[string]types.OutboundChannel
+	outbound map[string]types.ReplySender
 }
 
 var _ types.Registry = (*Registry)(nil)
@@ -30,7 +30,7 @@ var _ types.Registry = (*Registry)(nil)
 func NewRegistry() *Registry {
 	return &Registry{
 		inbound:  make(map[string]types.InboundChannel),
-		outbound: make(map[string]types.OutboundChannel),
+		outbound: make(map[string]types.ReplySender),
 	}
 }
 
@@ -53,8 +53,13 @@ func (r *Registry) RegisterInbound(name string, ch types.InboundChannel) {
 	r.inbound[name] = ch
 }
 
-// RegisterOutbound adds an outbound-only channel.
-func (r *Registry) RegisterOutbound(name string, ch types.OutboundChannel) {
+// RegisterOutbound adds a reply sender.
+//
+// ReplySender rather than OutboundChannel: a stream channel's Run takes a
+// binding and a sink, so it cannot satisfy openclaw's Run(ctx) error, yet it
+// still delivers replies. Telegram is that case — long-poll inbound, ordinary
+// HTTPS outbound.
+func (r *Registry) RegisterOutbound(name string, ch types.ReplySender) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.outbound[name] = ch
@@ -71,8 +76,8 @@ func (r *Registry) Inbound(name string) (types.InboundChannel, error) {
 	return ch, nil
 }
 
-// Outbound returns the outbound half for name.
-func (r *Registry) Outbound(name string) (types.OutboundChannel, error) {
+// Outbound returns the reply sender for name.
+func (r *Registry) Outbound(name string) (types.ReplySender, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	ch, ok := r.outbound[name]

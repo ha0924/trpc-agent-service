@@ -22,6 +22,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/mock"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/telegram"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecom"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/wecomaibot"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/config"
@@ -122,6 +123,12 @@ func run() error {
 	// no response to write), and only the supervisor consumes them.
 	streamChannels := map[string]types.StreamChannel{
 		wecomaibot.Name: wecomaibot.New(cfg.ResolveSecret, logger),
+		// Telegram is a stream channel too, though its transport is a long
+		// poll rather than a socket. What matters to the supervisor is that a
+		// loop must run and only one replica should run it: two replicas
+		// polling one bot would each take a share of the updates, splitting a
+		// conversation across processes.
+		telegram.Name: telegram.New(cfg.ResolveSecret, logger),
 	}
 
 	gw, err := gateway.New(gateway.Deps{
